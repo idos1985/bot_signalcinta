@@ -5,8 +5,8 @@ import os
 from datetime import datetime, UTC
 
 # ========== CONFIG ==========
-BOT_TOKEN = os.getenv("8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM")
-CHAT_ID = os.getenv("7183177114")
+BOT_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
+CHAT_ID = "7183177114"
 
 # toleransi untuk "menyentuh MA"
 TOL = 0.002   # 0.2%
