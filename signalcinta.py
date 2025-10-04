@@ -1,161 +1,126 @@
+import asyncio
+import logging
+from datetime import datetime, timezone
 import pandas as pd
-import requests
-import time
-import os
-from datetime import datetime, timedelta, timezone
+import ccxt
+from telegram import Bot
 
-# === Konfigurasi ===
-TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
-TELEGRAM_CHAT_ID = "7183177114"
+# ===== KONFIGURASI TELEGRAM =====
+TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"   # isi token bot
+CHAT_ID = "7183177114"          # isi chat id
 
-BASE_URL = "https://fapi.binance.com"
-SYMBOLS_URL = BASE_URL + "/fapi/v1/exchangeInfo"
-KLINES_URL = BASE_URL + "/fapi/v1/klines"
+bot = Bot(token=TELEGRAM_TOKEN)
 
-TF_LIST = {
-    "5m": "TWS_OP_5m.txt",
-    "15m": "TWS_OP_15m.txt",
-    "30m": "TWS_OP_30m.txt"
-}
-MA_WINDOWS = {"ma50": 50, "ma100": 100, "ma200": 200}
+logging.basicConfig(level=logging.INFO)
 
-# === Utils ===
-def send_telegram(msg: str):
+# ===== FUNGSI AMBIL DATA OHLCV =====
+def fetch_ohlcv(symbol, timeframe="1h", limit=150):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        exchange = ccxt.binance()
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(
+            ohlcv, columns=["time","open","high","low","close","volume"]
+        )
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+        df = df.astype({"open":float,"high":float,"low":float,"close":float})
+        return df
     except Exception as e:
-        print("Telegram error:", e)
+        logging.error(f"Gagal fetch {symbol} {timeframe}: {e}")
+        return None
 
-def fetch_klines(symbol, interval, limit=300):
-    url = f"{KLINES_URL}?symbol={symbol}&interval={interval}&limit={limit}"
-    r = requests.get(url, timeout=10)
-    data = r.json()
-    df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume","close_time",
-        "qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
-    ])
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
+# ===== HITUNG MA =====
+def add_ma(df, period=100):
+    df[f"MA{period}"] = df["close"].rolling(period).mean()
     return df
 
-def compute_ma(series, window):
-    return series.rolling(window=window).mean()
+# ===== DETEKSI BULLISH ENGULFING VALID =====
+def detect_bullish_engulfing(df1h, df2h):
+    last3 = df1h.iloc[-3:]  # ambil 3 candle terakhir
+    c1, c2, c3 = last3.iloc[0], last3.iloc[1], last3.iloc[2]
 
-def is_bullish(candle):
-    return candle["close"] > candle["open"]
+    # syarat: dua candle merah lalu engulfing bullish
+    cond_red = c1["close"] < c1["open"] and c2["close"] < c2["open"]
+    cond_green = c3["close"] > c3["open"]
+    cond_engulf = c3["close"] > c1["open"] and c3["open"] < c1["close"]
 
-def touched(value, low, high, tol=0.001):
-    return (low - tol) <= value <= (high + tol)
-
-# === Logika TWS ===
-def check_three_white_soldiers(df, tf_label):
-    if df is None or len(df) < max(MA_WINDOWS.values()) + 5:
+    if not (cond_red and cond_green and cond_engulf):
         return None
 
-    close = df["close"]
-    ma50 = compute_ma(close, MA_WINDOWS["ma50"])
-    ma100 = compute_ma(close, MA_WINDOWS["ma100"])
-    ma200 = compute_ma(close, MA_WINDOWS["ma200"])
+    # ambil MA100 tf 1h
+    ma100_1h = c3["MA100"]
 
-    c1 = df.iloc[-3]
-    c2 = df.iloc[-2]
-    c3 = df.iloc[-1]
-
-    if not (is_bullish(c1) and is_bullish(c2) and is_bullish(c3)):
-        return None
-    if not (c2["close"] > c1["close"] and c3["close"] > c2["close"]):
+    # cek apakah MA100 tf1h ada di antara open & close candle engulfing
+    low_val, high_val = sorted([c3["open"], c3["close"]])
+    if not (low_val <= ma100_1h <= high_val):
         return None
 
-    ma200_val = ma200.iloc[-3]
-    ma100_val = ma100.iloc[-2]
-    ma50_val  = ma50.iloc[-1]
-
-    # C1 hanya sentuh MA200
-    if not touched(ma200_val, c1["low"], c1["high"]): return None
-    if touched(ma100_val, c1["low"], c1["high"]) or touched(ma50_val, c1["low"], c1["high"]): return None
-
-    # C2 hanya sentuh MA100
-    if not touched(ma100_val, c2["low"], c2["high"]): return None
-    if touched(ma200_val, c2["low"], c2["high"]) or touched(ma50_val, c2["low"], c2["high"]): return None
-
-    # C3 hanya sentuh MA50
-    if not touched(ma50_val, c3["low"], c3["high"]): return None
-    if touched(ma200_val, c3["low"], c3["high"]) or touched(ma100_val, c3["low"], c3["high"]): return None
+    # cek apakah MA100 tf2h juga ada di range itu
+    last2h = df2h.iloc[-1]
+    ma100_2h = last2h["MA100"]
+    if not (low_val <= ma100_2h <= high_val):
+        return None
 
     return {
-        "tf": tf_label,
-        "timestamp": c3["close_time"],
-        "price_at_ma50": float(ma50_val),
-        "last_close": float(c3["close"])
+        "time": str(c3["time"]),
+        "open": c3["open"],
+        "close": c3["close"],
+        "ma100_1h": ma100_1h,
+        "ma100_2h": ma100_2h,
     }
 
-# === Helper file ===
-def save_signal(tf, symbol, signal):
-    filename = TF_LIST[tf]
-    with open(filename, "w") as f:
-        f.write(f"{symbol},{signal['timestamp']},{signal['price_at_ma50']},{signal['last_close']}\n")
-
-def load_signal(tf):
-    filename = TF_LIST[tf]
-    if not os.path.exists(filename):
-        return None
-    with open(filename, "r") as f:
-        line = f.readline().strip()
-        if not line:
-            return None
-        parts = line.split(",")
-        return {
-            "symbol": parts[0],
-            "timestamp": datetime.fromisoformat(parts[1]),
-            "price_at_ma50": float(parts[2]),
-            "last_close": float(parts[3])
-        }
-
-# === Scan ===
-def scan_symbol(symbol):
+# ===== TELEGRAM =====
+async def send_telegram(text: str):
     try:
-        # Skip kalau daily drop >=7%
-        daily = fetch_klines(symbol, "1d", limit=2)
-        if daily.empty:
-            return
-        prev_close = daily.iloc[-2]["close"]
-        last_close = daily.iloc[-1]["close"]
-        drop = (last_close - prev_close) / prev_close * 100
-        if drop <= -7:
-            return
-
-        for tf in TF_LIST:
-            df = fetch_klines(symbol, tf, limit=250)
-            signal = check_three_white_soldiers(df, tf)
-            if signal:
-                now = datetime.now(timezone.utc)
-                if now - signal["timestamp"] > timedelta(hours=6):
-                    continue
-                save_signal(tf, symbol, signal)
-                msg = (f"✅ TWS {tf} VALID\n"
-                       f"Pair: {symbol}\n"
-                       f"Waktu: {signal['timestamp']}\n"
-                       f"Harga MA50: {signal['price_at_ma50']}\n"
-                       f"Close: {signal['last_close']}")
-                send_telegram(msg)
+        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
     except Exception as e:
-        print("Error scan", symbol, e)
+        logging.error(f"Telegram error: {e}")
 
-def scan_all_pairs():
-    try:
-        data = requests.get(SYMBOLS_URL, timeout=10).json()
-        symbols = [s["symbol"] for s in data["symbols"] if s["contractType"] in ("PERPETUAL")]
-        for sym in symbols:
-            if sym.endswith("USDT") or sym.endswith("USD"):
-                scan_symbol(sym)
-    except Exception as e:
-        print("Error ambil symbols:", e)
+# ===== SCAN =====
+async def scan():
+    logging.info("=== Mulai Scan Bullish Engulfing ===")
+    exchange = ccxt.binance()
+    markets = exchange.load_markets()
 
-# === Main Loop ===
-if __name__ == "__main__":
+    symbols = [
+        s for s in markets if (s.endswith("/USDT") and (":USDT" not in s))
+    ]
+
+    for symbol in symbols:
+        df1h = fetch_ohlcv(symbol, "1h", 200)
+        df2h = fetch_ohlcv(symbol, "2h", 200)
+        df1d = fetch_ohlcv(symbol, "1d", 10)
+
+        if df1h is None or df2h is None or df1d is None:
+            continue
+
+        df1h = add_ma(df1h, 100)
+        df2h = add_ma(df2h, 100)
+
+        # hindari koin yang turun >5% di daily
+        d_last = df1d.iloc[-1]
+        if (d_last["close"] - d_last["open"]) / d_last["open"] <= -0.05:
+            continue
+
+        result = detect_bullish_engulfing(df1h, df2h)
+        if result:
+            msg = (
+                f"✅ *Bullish Engulfing VALID*\n\n"
+                f"Pair: `{symbol}`\n"
+                f"🕒 {result['time']}\n"
+                f"Open: {result['open']}\n"
+                f"Close: {result['close']}\n"
+                f"MA100 (1h): {result['ma100_1h']:.4f}\n"
+                f"MA100 (2h): {result['ma100_2h']:.4f}"
+            )
+            await send_telegram(msg)
+
+# ===== MAIN LOOP =====
+async def main_loop():
     while True:
-        print(f"Scan dimulai... {datetime.now()}")
-        scan_all_pairs()
-        time.sleep(60 * 20)  # tunggu 20 menit
+        now = datetime.now(timezone.utc)
+        if now.minute % 30 == 0:  # tiap 30 menit
+            await scan()
+        await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(main_loop())
