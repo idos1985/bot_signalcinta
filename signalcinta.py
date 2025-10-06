@@ -20,7 +20,16 @@ sent_signals = set()
 pending_1h = []   # simpan sinyal TF1H -> tunggu 4H close
 pending_15m = []  # simpan sinyal TF15M -> tunggu 1H close
 
-logging.basicConfig(level=logging.INFO)
+# --- Logging setup ---
+# Hanya WARNING/ERROR ke console, detail ke file
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log", mode="a", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 
 
 # --- Helper Function ---
@@ -40,7 +49,7 @@ def get_ohlcv(exchange, symbol, timeframe, limit=200):
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Jakarta")
         return df
     except Exception as e:
-        logging.error(f"OHLCV error {symbol}-{timeframe}: {e}")
+        logging.debug(f"OHLCV error {symbol}-{timeframe}: {e}")  # hanya ke file
         return None
 
 
@@ -78,6 +87,7 @@ def is_1h_close(now: datetime) -> bool:
 
 # --- Scan 1H Engulfing ---
 async def scan_1h(exchange, name=""):
+    error_count = 0
     markets = exchange.load_markets()
     symbols = [s for s in markets if s.endswith(("USDT", "USD"))]
 
@@ -112,12 +122,16 @@ async def scan_1h(exchange, name=""):
                         f"Time: {df1h.iloc[-1]['time']}"
                     )
 
-        except Exception as e:
-            logging.error(f"Error {symbol} (1H): {e}")
+        except Exception:
+            error_count += 1
+
+    if error_count > 0:
+        logging.warning(f"{name} (1H): {error_count} pair gagal diproses.")
 
 
 # --- Scan 15M Engulfing ---
 async def scan_15m(exchange, name=""):
+    error_count = 0
     markets = exchange.load_markets()
     symbols = [s for s in markets if s.endswith(("USDT", "USD"))]
 
@@ -147,33 +161,31 @@ async def scan_15m(exchange, name=""):
                         name, symbol, o, c, df15m.iloc[-1]['time']
                     ))
 
-        except Exception as e:
-            logging.error(f"Error {symbol} (15M): {e}")
+        except Exception:
+            error_count += 1
+
+    if error_count > 0:
+        logging.warning(f"{name} (15M): {error_count} pair gagal diproses.")
 
 
 # --- Main ---
 async def main():
     global pending_1h, pending_15m
     while True:
-        logging.info("Mulai scanning semua futures...")
-
+        # Scan semua exchange
         await scan_1h(exchange_usdm, "USDⓈ-M")
         await scan_1h(exchange_coinm, "COIN-M")
-
         await scan_15m(exchange_usdm, "USDⓈ-M")
         await scan_15m(exchange_coinm, "COIN-M")
 
-        # cek apakah jam sekarang 4H close → kirim pending sinyal TF1H
+        # Cek close timeframe
         now = datetime.now().astimezone()
         if is_4h_close(now) and pending_1h:
-            logging.info("Kirim pending sinyal TF1H (barengan 4H close).")
             for msg in pending_1h:
                 await send_telegram(msg)
             pending_1h = []
 
-        # cek apakah jam sekarang 1H close → kirim pending sinyal TF15M
         if is_1h_close(now) and pending_15m:
-            logging.info("Kirim pending sinyal TF15M (barengan 1H close).")
             for (name, symbol, o, c, t) in pending_15m:
                 msg = (
                     f"✅ [TF15M] Bullish Engulfing VALID\n"
@@ -186,7 +198,7 @@ async def main():
                 await send_telegram(msg)
             pending_15m = []
 
-        logging.info("Tidur 15 menit...")
+        # Tidur 15 menit
         await asyncio.sleep(15 * 60)
 
 
