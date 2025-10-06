@@ -17,7 +17,8 @@ exchange_coinm = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType
 
 # Cache
 sent_signals = set()
-pending_signals = []   # <--- buat nampung sinyal sementara
+pending_1h = []   # simpan sinyal TF1H -> tunggu 4H close
+pending_15m = []  # simpan sinyal TF15M -> tunggu 1H close
 
 logging.basicConfig(level=logging.INFO)
 
@@ -61,9 +62,9 @@ def check_daily_drop(df):
     return drop < -5
 
 
-def check_ma50_inside(open_price, close_price, df4h):
-    df4h["ma50"] = df4h["close"].rolling(50).mean()
-    last_ma50 = df4h.iloc[-1]["ma50"]
+def check_ma50_inside(open_price, close_price, df, period=50):
+    df["ma50"] = df["close"].rolling(period).mean()
+    last_ma50 = df.iloc[-1]["ma50"]
     return min(open_price, close_price) <= last_ma50 <= max(open_price, close_price)
 
 
@@ -71,12 +72,14 @@ def is_4h_close(now: datetime) -> bool:
     return now.minute == 0 and (now.hour % 4 == 0)
 
 
-# --- Main Scan ---
-async def scan_exchange(exchange, name=""):
+def is_1h_close(now: datetime) -> bool:
+    return now.minute == 0  # tiap jam pas close
+
+
+# --- Scan 1H Engulfing ---
+async def scan_1h(exchange, name=""):
     markets = exchange.load_markets()
     symbols = [s for s in markets if s.endswith(("USDT", "USD"))]
-
-    logging.info(f"{name}: Total {len(symbols)} pair futures ditemukan.")
 
     for symbol in symbols:
         try:
@@ -97,40 +100,94 @@ async def scan_exchange(exchange, name=""):
                 continue
 
             if check_ma50_inside(o, c, df4h):
-                signal_id = f"{name}-{symbol}-{df1h.iloc[-1]['time']}"
+                signal_id = f"1H-{name}-{symbol}-{df1h.iloc[-1]['time']}"
                 if signal_id not in sent_signals:
                     sent_signals.add(signal_id)
-                    pending_signals.append((
-                        f"✅ Bullish Engulfing VALID\n"
+                    pending_1h.append(
+                        f"✅ [TF1H] Bullish Engulfing VALID\n"
                         f"Exchange: {name}\n"
                         f"Pair: {symbol}\n"
                         f"Open: {o}\n"
                         f"Close: {c}\n"
                         f"Time: {df1h.iloc[-1]['time']}"
+                    )
+
+        except Exception as e:
+            logging.error(f"Error {symbol} (1H): {e}")
+
+
+# --- Scan 15M Engulfing ---
+async def scan_15m(exchange, name=""):
+    markets = exchange.load_markets()
+    symbols = [s for s in markets if s.endswith(("USDT", "USD"))]
+
+    for symbol in symbols:
+        try:
+            df1d = get_ohlcv(exchange, symbol, "1d", 10)
+            if df1d is None or check_daily_drop(df1d):
+                continue
+
+            df15m = get_ohlcv(exchange, symbol, "15m", 100)
+            if df15m is None:
+                continue
+
+            engulf, o, c = is_bullish_engulfing(df15m)
+            if not engulf:
+                continue
+
+            df1h = get_ohlcv(exchange, symbol, "1h", 100)
+            if df1h is None:
+                continue
+
+            if check_ma50_inside(o, c, df1h):
+                signal_id = f"15M-{name}-{symbol}-{df15m.iloc[-1]['time']}"
+                if signal_id not in sent_signals:
+                    sent_signals.add(signal_id)
+                    pending_15m.append((
+                        name, symbol, o, c, df15m.iloc[-1]['time']
                     ))
 
         except Exception as e:
-            logging.error(f"Error {symbol}: {e}")
+            logging.error(f"Error {symbol} (15M): {e}")
 
 
+# --- Main ---
 async def main():
-    global pending_signals
+    global pending_1h, pending_15m
     while True:
         logging.info("Mulai scanning semua futures...")
-        await scan_exchange(exchange_usdm, "USDⓈ-M")
-        await scan_exchange(exchange_coinm, "COIN-M")
-        logging.info("Scan selesai.")
 
-        # cek apakah jam sekarang 4H close
+        await scan_1h(exchange_usdm, "USDⓈ-M")
+        await scan_1h(exchange_coinm, "COIN-M")
+
+        await scan_15m(exchange_usdm, "USDⓈ-M")
+        await scan_15m(exchange_coinm, "COIN-M")
+
+        # cek apakah jam sekarang 4H close → kirim pending sinyal TF1H
         now = datetime.now().astimezone()
-        if is_4h_close(now) and pending_signals:
-            logging.info("Kirim pending sinyal (4H close).")
-            for msg in pending_signals:
+        if is_4h_close(now) and pending_1h:
+            logging.info("Kirim pending sinyal TF1H (barengan 4H close).")
+            for msg in pending_1h:
                 await send_telegram(msg)
-            pending_signals = []  # kosongkan setelah kirim
+            pending_1h = []
 
-        logging.info("Tidur 1 jam...")
-        await asyncio.sleep(60 * 60)
+        # cek apakah jam sekarang 1H close → kirim pending sinyal TF15M
+        if is_1h_close(now) and pending_15m:
+            logging.info("Kirim pending sinyal TF15M (barengan 1H close).")
+            for (name, symbol, o, c, t) in pending_15m:
+                msg = (
+                    f"✅ [TF15M] Bullish Engulfing VALID\n"
+                    f"Exchange: {name}\n"
+                    f"Pair: {symbol}\n"
+                    f"Open: {o}\n"
+                    f"Close: {c}\n"
+                    f"Time: {t}"
+                )
+                await send_telegram(msg)
+            pending_15m = []
+
+        logging.info("Tidur 15 menit...")
+        await asyncio.sleep(15 * 60)
 
 
 if __name__ == "__main__":
