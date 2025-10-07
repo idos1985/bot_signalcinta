@@ -1,367 +1,189 @@
-# main.py
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-import math
-import ccxt
+from datetime import datetime, timedelta, timezone
 import pandas as pd
+import ccxt
 from telegram import Bot
 
-# ---------------- CONFIG ----------------
+# === KONFIGURASI TELEGRAM ===
 API_KEY = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 CHAT_ID = "7183177114"
+bot = Bot(API_KEY)
 
-# Exchanges: USDⓈ-M (future) and COIN-M (delivery)
+# === SETUP LOGGING ===
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# === EXCHANGE INSTANCE ===
 exchange_usdm = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
 exchange_coinm = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'delivery'}})
 
-bot = Bot(API_KEY)
+# === CACHE SIGNAL ===
+sent_signals = set()
 
-# state
-sent_signals = set()   # avoid duplicate signals: ids like "15m-USDⓈ-M-BTCUSDT-<ts>"
-last_processed = {"15m": None, "30m": None, "1h": None, "2h": None}
-
-# small delay between fetches to reduce pressure
-RATE_DELAY = 0.12  # seconds
-
-# wait-after-close before fetching to let exchange finalize candle
-WAIT_AFTER_CLOSE_SECONDS = 20
-
-# Logging (railway-friendly)
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log", mode="a", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
-
-# ---------------- Helpers ----------------
-def now_utc():
-    return datetime.now(timezone.utc)
-
-async def safe_sleep(seconds: float):
-    await asyncio.sleep(seconds)
-
-async def send_telegram(msg: str):
+# === RESAMPLE FUNCTION (Sudah aman, tanpa 'T') ===
+def resample_ohlcv(df, tf_minutes):
+    """Mengubah data OHLCV ke timeframe lain dengan aman (tanpa warning)."""
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        rule = f"{tf_minutes}min"  # gunakan 'min' bukan 'T'
+        agg = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }
+        res = (
+            df.resample(rule, label="right", closed="right")
+            .agg(agg)
+            .dropna(how="all")
+        )
+        return res
     except Exception as e:
-        logging.error(f"Telegram send error: {e}")
+        logging.error(f"Resample error: {e}")
+        return df
 
-def _parse_timeframe_minutes(tf: str):
-    """
-    Parse timeframe string like '15m', '1h', '8h' into minutes integer.
-    Return minutes or None if unknown format.
-    """
-    tf = tf.lower().strip()
-    if tf.endswith('m'):
-        return int(tf[:-1])
-    if tf.endswith('h'):
-        return int(tf[:-1]) * 60
-    if tf.endswith('d'):
-        return int(tf[:-1]) * 60 * 24
-    return None
 
-def _resample_ohlcv(df_base: pd.DataFrame, base_tf_min: int, target_tf_min: int):
-    """
-    Resample base timeframe OHLCV (base_tf_min minutes) into target timeframe (target_tf_min minutes).
-    - df_base must have columns ['time','open','high','low','close','volume'] with tz-aware 'time' (UTC).
-    """
-    if df_base is None or len(df_base) == 0:
-        return None
-    # set datetime index
-    df = df_base.copy()
-    df = df.set_index(pd.DatetimeIndex(df["time"]))
-    rule = f'{target_tf_min}T'  # pandas offset alias in minutes, e.g., '240T' for 4h
-    agg = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }
-    res = df.resample(rule, label='right', closed='right').agg(agg).dropna(how='all')
-    # Reset index into 'time' column (tz-aware)
-    res = res.reset_index().rename(columns={'index': 'time'})
-    res = res[['time', 'open', 'high', 'low', 'close', 'volume']]
-    # ensure time column tz-aware UTC
-    res['time'] = pd.to_datetime(res['time']).dt.tz_convert('UTC')
-    return res
-
-def get_ohlcv_with_resample(exchange, symbol, timeframe, limit=200):
-    """
-    Attempt to fetch ohlcv for 'timeframe'. If exchange supports timeframe directly -> use it.
-    Otherwise try to resample from base timeframe ('1m' for minute-based, '1h' for hour-based).
-    Returns DataFrame with tz-aware UTC times or None on failure.
-    """
-    tf = timeframe.lower()
-    # direct fetch if supported
+# === TELEGRAM SEND ===
+async def send_telegram(message: str):
     try:
-        if hasattr(exchange, 'timeframes') and tf in exchange.timeframes:
-            data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
-            df["open"] = df["open"].astype(float)
-            df["close"] = df["close"].astype(float)
-            df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-            return df
+        await bot.send_message(chat_id=CHAT_ID, text=message)
     except Exception as e:
-        logging.debug(f"Direct fetch error {symbol} {timeframe}: {e}")
+        logging.error(f"Telegram error: {e}")
 
-    # resample path
-    minutes = _parse_timeframe_minutes(tf)
-    if minutes is None:
-        return None
 
-    # choose base timeframe for resampling
-    # prefer '1h' if minutes >= 60 else '1m'
-    if minutes >= 60:
-        base_tf = '1h'
-        base_minutes = 60
-    else:
-        base_tf = '1m'
-        base_minutes = 1
-
-    multiplier = minutes // base_minutes
-    # ensure integer multiplier
-    if multiplier < 1:
-        multiplier = 1
-
-    # need more base candles to generate 'limit' target candles
-    needed_base = limit * multiplier + 10  # small safety margin
+# === FETCH OHLCV ===
+def get_ohlcv(exchange, symbol, timeframe, limit=200):
     try:
-        data = exchange.fetch_ohlcv(symbol, timeframe=base_tf, limit=needed_base)
+        data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
-        df["open"] = df["open"].astype(float)
-        df["close"] = df["close"].astype(float)
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        # resample to target minutes
-        res = _resample_ohlcv(df, base_minutes, minutes)
-        # take last 'limit' rows
-        if res is None or len(res) == 0:
-            return None
-        return res.tail(limit).reset_index(drop=True)
+        df.set_index("time", inplace=True)
+        df = df.astype(float)
+        return df
     except Exception as e:
-        logging.debug(f"Resample fetch error {symbol} {timeframe} from {base_tf}: {e}")
+        logging.error(f"Fetch error {symbol}-{timeframe}: {e}")
         return None
 
-def is_bullish_engulfing_df(df):
-    """Return (True, open, close, close_time) if last candle is bullish engulfing over previous 2 red candles."""
-    try:
-        c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    except Exception:
-        return False, None, None, None
-    if (c1["close"] < c1["open"]) and (c2["close"] < c2["open"]) and (c3["close"] > c3["open"]):
-        min_open = min(c1["open"], c2["open"])
-        max_close = max(c1["close"], c2["close"])
-        if (c3["open"] < min_open) and (c3["close"] > max_close):
-            return True, float(c3["open"]), float(c3["close"]), c3["time"]
-    return False, None, None, None
 
-def check_daily_drop(df1d):
-    """Return True if daily drop >=5% (from first open to last close)."""
-    if df1d is None or len(df1d) < 2:
-        return False
-    first = df1d.iloc[0]["open"]
-    last = df1d.iloc[-1]["close"]
+# === CHECK DAILY DROP ===
+def check_daily_drop(df):
+    """Cek apakah harga turun ≥ 5% di TF 1D."""
+    first = df.iloc[0]["open"]
+    last = df.iloc[-1]["close"]
     drop = (last - first) / first * 100
     return drop < -5
 
-def ma20_ma50_and_extra_check(open_price, close_price, df_higher_main, df_higher_extra,
-                              ma20_main=20, ma50_main=50, ma20_extra=20):
-    """
-    Validate:
-      (A) MA20_main and MA50_main on df_higher_main both lie in [open,close] and MA20_main < MA50_main
-      (B) MA20_extra on df_higher_extra lies in [open,close]
-    Returns (True, ma20_main_val, ma50_main_val, ma20_extra_val) or (False, None, None, None)
-    """
-    # check main ma20 & ma50
-    if df_higher_main is None or len(df_higher_main) < max(ma20_main, ma50_main):
-        return False, None, None, None
-    dfm = df_higher_main.copy()
-    dfm[f"ma{ma20_main}"] = dfm["close"].rolling(ma20_main).mean()
-    dfm[f"ma{ma50_main}"] = dfm["close"].rolling(ma50_main).mean()
-    ma20_main_val = dfm.iloc[-1][f"ma{ma20_main}"]
-    ma50_main_val = dfm.iloc[-1][f"ma{ma50_main}"]
-    if pd.isna(ma20_main_val) or pd.isna(ma50_main_val):
-        return False, None, None, None
 
-    lo = min(open_price, close_price)
-    hi = max(open_price, close_price)
-    cond_main = (lo <= ma20_main_val <= hi) and (lo <= ma50_main_val <= hi) and (ma20_main_val < ma50_main_val)
-    if not cond_main:
-        return False, None, None, None
+# === BULLISH ENGULFING DETECTOR ===
+def is_bullish_engulfing(df):
+    """Deteksi pola Bullish Engulfing menelan 2 candle merah sebelumnya."""
+    if len(df) < 3:
+        return False, None, None
 
-    # check extra MA20 on df_higher_extra
-    if df_higher_extra is None or len(df_higher_extra) < ma20_extra:
-        return False, None, None, None
-    dfe = df_higher_extra.copy()
-    dfe[f"ma{ma20_extra}"] = dfe["close"].rolling(ma20_extra).mean()
-    ma20_extra_val = dfe.iloc[-1][f"ma{ma20_extra}"]
-    if pd.isna(ma20_extra_val):
-        return False, None, None, None
-    cond_extra = (lo <= ma20_extra_val <= hi)
-    if not cond_extra:
-        return False, None, None, None
+    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
 
-    return True, float(ma20_main_val), float(ma50_main_val), float(ma20_extra_val)
+    if c1["close"] < c1["open"] and c2["close"] < c2["open"] and c3["close"] > c3["open"]:
+        min_open = min(c1["open"], c2["open"])
+        max_close = max(c1["close"], c2["close"])
+        if c3["open"] < min_open and c3["close"] > max_close:
+            return True, c3["open"], c3["close"]
 
-# ---------------- Scanners per TF ----------------
-async def process_tf_once(tf_check, tf_higher_main, tf_higher_extra, exchange, name, symbols,
-                          ma20_main=20, ma50_main=50, ma20_extra=20):
-    """
-    Process scanning for one TF:
-    - tf_check: the timeframe to detect engulfing (ex: '15m')
-    - tf_higher_main: timeframe to compute MA20 & MA50 (ex: '1h')
-    - tf_higher_extra: timeframe to compute extra MA20 (ex: '2h')
-    """
-    error_count = 0
-    sent_count = 0
+    return False, None, None
+
+
+# === CHECK MA POSITION ===
+def check_ma_inside(open_price, close_price, df, ma_period):
+    """Cek apakah MA berada di antara open dan close candle."""
+    df[f"ma{ma_period}"] = df["close"].rolling(ma_period).mean()
+    last_ma = df.iloc[-1][f"ma{ma_period}"]
+    return min(open_price, close_price) <= last_ma <= max(open_price, close_price)
+
+
+# === MAIN SCAN PER TIMEFRAME ===
+async def scan_timeframe(exchange, name, tf_main, tf_ma1, tf_ma2, tf_ma_extra, scan_interval, ma20_label, ma50_label):
+    markets = exchange.load_markets()
+    symbols = [s for s in markets if s.endswith(("USDT", "USD"))]
+
+    logging.info(f"Mulai scan {tf_main} untuk {name}, total {len(symbols)} pair.")
+
     for symbol in symbols:
         try:
-            # daily filter
-            df1d = get_ohlcv_with_resample(exchange, symbol, "1d", 10)
-            await safe_sleep(RATE_DELAY)
+            # Skip jika turun 5% di TF 1D
+            df1d = get_ohlcv(exchange, symbol, "1d", 10)
             if df1d is None or check_daily_drop(df1d):
                 continue
 
-            df_check = get_ohlcv_with_resample(exchange, symbol, tf_check, 300)
-            await safe_sleep(RATE_DELAY)
-            if df_check is None or len(df_check) < 3:
+            # Deteksi Engulfing di timeframe utama
+            df_main = get_ohlcv(exchange, symbol, tf_main, 100)
+            if df_main is None:
                 continue
 
-            engulf, o, c, t_close = is_bullish_engulfing_df(df_check)
+            engulf, o, c = is_bullish_engulfing(df_main)
             if not engulf:
                 continue
 
-            # fetch main higher (for MA20 & MA50) and extra higher (for MA20)
-            df_main = get_ohlcv_with_resample(exchange, symbol, tf_higher_main, 300)
-            await safe_sleep(RATE_DELAY)
-            df_extra = get_ohlcv_with_resample(exchange, symbol, tf_higher_extra, 300)
-            await safe_sleep(RATE_DELAY)
-            if df_main is None or df_extra is None:
+            # MA validasi pertama (MA20 bawah, MA50 atas)
+            df_ma1 = get_ohlcv(exchange, symbol, tf_ma1, 100)
+            if df_ma1 is None:
                 continue
 
-            ok, ma20_main_val, ma50_main_val, ma20_extra_val = ma20_ma50_and_extra_check(
-                o, c, df_main, df_extra, ma20_main, ma50_main, ma20_extra
-            )
-            if not ok:
+            df_ma1["ma20"] = df_ma1["close"].rolling(20).mean()
+            df_ma1["ma50"] = df_ma1["close"].rolling(50).mean()
+            ma20 = df_ma1.iloc[-1]["ma20"]
+            ma50 = df_ma1.iloc[-1]["ma50"]
+
+            # Cek posisi MA20 & MA50 terhadap open/close candle
+            if not (min(o, c) <= ma20 <= max(o, c) and min(o, c) <= ma50 <= max(o, c)):
                 continue
 
-            # unique id per candle close timestamp
-            sig_id = f"{tf_check}-{name}-{symbol}-{int(pd.Timestamp(t_close).timestamp())}"
-            if sig_id in sent_signals:
+            # MA validasi tambahan (MA20 dari timeframe lebih besar)
+            df_extra = get_ohlcv(exchange, symbol, tf_ma_extra, 100)
+            if df_extra is None:
                 continue
-            sent_signals.add(sig_id)
-            sent_count += 1
+            if not check_ma_inside(o, c, df_extra, 20):
+                continue
 
-            msg = (
-                f"✅ VALID SIGNAL\n"
-                f"TF detected : {tf_check}\n"
-                f"Exchange    : {name}\n"
-                f"Pair        : {symbol}\n"
-                f"Open        : {o}\n"
-                f"Close       : {c}\n"
-                f"Candle UTC  : {t_close.isoformat()}\n"
-                f"Higher main : {tf_higher_main} | MA20 = {ma20_main_val:.8f} | MA50 = {ma50_main_val:.8f}\n"
-                f"Higher extra: {tf_higher_extra} | MA20 = {ma20_extra_val:.8f}\n"
-            )
-            await send_telegram(msg)
+            # Jika semua valid → kirim notif
+            signal_id = f"{name}-{symbol}-{tf_main}-{df_main.index[-1]}"
+            if signal_id not in sent_signals:
+                sent_signals.add(signal_id)
+                msg = (
+                    f"✅ Bullish Engulfing VALID [{tf_main}]\n"
+                    f"Exchange: {name}\n"
+                    f"Pair: {symbol}\n"
+                    f"Open: {o:.4f}\n"
+                    f"Close: {c:.4f}\n"
+                    f"MA20 ({tf_ma1}) & MA50 ({tf_ma1}) di antara range\n"
+                    f"MA20 tambahan di TF {tf_ma_extra}\n"
+                    f"Time: {df_main.index[-1].strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                )
+                await send_telegram(msg)
 
-        except Exception:
-            error_count += 1
+        except Exception as e:
+            logging.error(f"Error {symbol}: {e}")
 
-    if error_count:
-        logging.warning(f"{name} {tf_check}: {error_count} pair gagal diproses.")
-    if sent_count:
-        logging.warning(f"{name} {tf_check}: {sent_count} sinyal terkirim.")
+    # Tunggu sampai close candle berikutnya (sinkron jam Binance)
+    now_utc = datetime.now(timezone.utc)
+    next_close = (now_utc + timedelta(minutes=scan_interval)).replace(second=20, microsecond=0)
+    sleep_time = (next_close - now_utc).total_seconds()
+    logging.info(f"Tidur {sleep_time/60:.1f} menit untuk TF {tf_main}.")
+    await asyncio.sleep(sleep_time)
 
-# ---------------- Main loop & timing ----------------
+
+# === MAIN LOOP ===
 async def main():
     while True:
-        utc = now_utc()
-        minute = utc.minute
-        second = utc.second
-        hour = utc.hour
-
-        # determine due TFs: we wait until >= WAIT_AFTER_CLOSE_SECONDS after exact close
-        due_tfs = []
-
-        if second >= WAIT_AFTER_CLOSE_SECONDS:
-            if minute % 15 == 0:
-                close_dt_15 = utc.replace(second=0, microsecond=0) - timedelta(minutes=utc.minute % 15)
-                close_ts = int(close_dt_15.timestamp())
-                if last_processed["15m"] != close_ts:
-                    due_tfs.append("15m")
-                    last_processed["15m"] = close_ts
-
-            if minute % 30 == 0:
-                close_dt_30 = utc.replace(second=0, microsecond=0) - timedelta(minutes=utc.minute % 30)
-                close_ts = int(close_dt_30.timestamp())
-                if last_processed["30m"] != close_ts:
-                    due_tfs.append("30m")
-                    last_processed["30m"] = close_ts
-
-            if minute == 0:
-                close_dt_1h = utc.replace(minute=0, second=0, microsecond=0)
-                close_ts = int(close_dt_1h.timestamp())
-                if last_processed["1h"] != close_ts:
-                    due_tfs.append("1h")
-                    last_processed["1h"] = close_ts
-
-                if hour % 2 == 0:
-                    close_dt_2h = utc.replace(minute=0, second=0, microsecond=0)
-                    close_ts = int(close_dt_2h.timestamp())
-                    if last_processed["2h"] != close_ts:
-                        due_tfs.append("2h")
-                        last_processed["2h"] = close_ts
-
-        # load markets once per loop
-        try:
-            markets_usdm = exchange_usdm.load_markets()
-            symbols_usdm = [s for s, m in markets_usdm.items() if s.endswith(("USDT", "USD"))]
-        except Exception as e:
-            logging.warning(f"Failed loading USDM markets: {e}")
-            symbols_usdm = []
-
-        try:
-            markets_coinm = exchange_coinm.load_markets()
-            symbols_coinm = [s for s, m in markets_coinm.items() if s.endswith(("USDT", "USD"))]
-        except Exception as e:
-            logging.warning(f"Failed loading COINM markets: {e}")
-            symbols_coinm = []
-
-        # Run scanners for due TFs (sequential to reduce concurrent API load)
-        for tf in due_tfs:
-            if tf == "15m":
-                # 15m -> check main 1h (MA20/MA50) and extra 2h (MA20)
-                await process_tf_once("15m", "1h", "2h", exchange_usdm, "USDⓈ-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_usdm)
-                await process_tf_once("15m", "1h", "2h", exchange_coinm, "COIN-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_coinm)
-            elif tf == "30m":
-                # 30m -> main 2h, extra 4h
-                await process_tf_once("30m", "2h", "4h", exchange_usdm, "USDⓈ-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_usdm)
-                await process_tf_once("30m", "2h", "4h", exchange_coinm, "COIN-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_coinm)
-            elif tf == "1h":
-                # 1h -> main 4h, extra 8h
-                await process_tf_once("1h", "4h", "8h", exchange_usdm, "USDⓈ-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_usdm)
-                await process_tf_once("1h", "4h", "8h", exchange_coinm, "COIN-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_coinm)
-            elif tf == "2h":
-                # 2h -> main 8h, extra 16h (resampled if needed)
-                await process_tf_once("2h", "8h", "16h", exchange_usdm, "USDⓈ-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_usdm)
-                await process_tf_once("2h", "8h", "16h", exchange_coinm, "COIN-M",
-                                      ma20_main=20, ma50_main=50, ma20_extra=20, symbols=symbols_coinm)
-
-        # sleep short interval and re-evaluate (5s granularity)
-        await asyncio.sleep(5)
-
+        # Jalankan semua timeframe
+        await asyncio.gather(
+            scan_timeframe(exchange_usdm, "USDⓈ-M", "15m", "1h", "2h", "2h", 15, "MA20", "MA50"),
+            scan_timeframe(exchange_usdm, "USDⓈ-M", "30m", "2h", "4h", "4h", 30, "MA20", "MA50"),
+            scan_timeframe(exchange_usdm, "USDⓈ-M", "1h", "4h", "8h", "8h", 60, "MA20", "MA50"),
+            scan_timeframe(exchange_usdm, "USDⓈ-M", "2h", "8h", "16h", "16h", 120, "MA20", "MA50"),
+            scan_timeframe(exchange_coinm, "COIN-M", "15m", "1h", "2h", "2h", 15, "MA20", "MA50"),
+            scan_timeframe(exchange_coinm, "COIN-M", "30m", "2h", "4h", "4h", 30, "MA20", "MA50"),
+            scan_timeframe(exchange_coinm, "COIN-M", "1h", "4h", "8h", "8h", 60, "MA20", "MA50"),
+            scan_timeframe(exchange_coinm, "COIN-M", "2h", "8h", "16h", "16h", 120, "MA20", "MA50"),
+        )
 
 if __name__ == "__main__":
     asyncio.run(main())
