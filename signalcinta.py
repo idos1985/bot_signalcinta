@@ -1,13 +1,16 @@
 # main.py
 """
-Bot scanner — Bullish Engulfing + EMA20 bawah & EMA200 atas (same timeframe)
-Timeframes: 15m (scan every 15m), 30m (every 30m), 1h (every 1h)
-Scans all Binance futures pairs (USDⓈ-M and COIN-M).
+Bot scanner — Bullish Engulfing + EMA20 bawah & EMA100 atas (same timeframe)
+Timeframes: 30m, 1h, 2h
+Scans all Binance USDⓈ-M (USDT perpetual) futures pairs.
+Persists sent signals to sent_signals.json to avoid duplicate notifications.
 """
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timezone, timedelta
 import ccxt
 import pandas as pd
 from telegram import Bot
@@ -16,29 +19,50 @@ from telegram import Bot
 BOT_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"   # <-- isi sendiri
 CHAT_ID = "7183177114"       # <-- isi sendiri
 
-# Exchanges instances: futures and coin-margined (delivery)
+# use Binance futures (USDT perpetual)
 exchange_usdm = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-exchange_coinm = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'delivery'}})
 
 bot = Bot(BOT_TOKEN)
 
-# state for deduplication
-sent_signals = set()
+# persistent file for sent signals
+SENT_FILE = "sent_signals.json"
 
-# small delay between fetches to reduce API pressure
-RATE_DELAY = 0.12  # seconds
+# rate and timing
+RATE_DELAY = 0.12           # seconds between fetches (reduce API pressure)
+WAIT_AFTER_CLOSE = 20       # seconds to wait after candle close to ensure OHLCV finalized
+SLEEP_GRANULARITY = 5       # seconds loop sleep granularity
 
-# wait after UTC candle close to ensure OHLCV finalized
-WAIT_AFTER_CLOSE = 20  # seconds
-
-# logging (railway-friendly)
+# logging (keep minimal to avoid Railway log limits)
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# keep track last processed candle timestamp for each TF to avoid double processing
-last_processed = {"15m": None, "30m": None, "1h": None}
+# track last processed close timestamps per TF to avoid double-processing in same run
+last_processed = {"30m": None, "1h": None, "2h": None}
 
 
-# ---------------- HELPERS ----------------
+# ---------------- Persistence helpers ----------------
+def load_sent_signals():
+    if os.path.exists(SENT_FILE):
+        try:
+            with open(SENT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_sent_signals(data):
+    try:
+        with open(SENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Failed saving sent_signals: {e}")
+
+
+# in-memory view of sent signals (load at startup)
+sent_signals = load_sent_signals()  # dict: { "BTCUSDT": { "30m": timestamp, "1h": ts } }
+
+
+# ---------------- Helpers ----------------
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -54,29 +78,28 @@ async def send_telegram(msg: str):
         logging.error(f"Telegram send error: {e}")
 
 
-def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 300):
+def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 500):
     """
-    Fetch OHLCV from exchange and return pandas DataFrame indexed by tz-aware UTC 'time'.
-    Return None on failure.
+    Fetch OHLCV and return DataFrame indexed by tz-aware UTC 'time', or None on failure.
     """
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        if not data:
+            return None
         df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         df = df.set_index("time")
-        # ensure numeric floats
         df = df.astype(float)
         return df
     except Exception as e:
-        # debug-level to file logs if you enable file handler; avoid flooding console
         logging.debug(f"fetch_ohlcv error {symbol} {timeframe}: {e}")
         return None
 
 
 def is_bullish_engulfing(df):
     """
-    Detect bullish engulfing: last candle (c3) green and engulfs previous 2 red candles.
-    Return (True, open_c3, close_c3, close_time) or (False, None, None, None).
+    Detect bullish engulfing where last candle (c3) is green and engulfs previous 2 red candles.
+    Return (True, open_c3, close_c3, close_time) or (False,...).
     """
     if df is None or len(df) < 3:
         return False, None, None, None
@@ -96,9 +119,7 @@ def is_bullish_engulfing(df):
 
 
 def check_daily_drop(df1d):
-    """
-    Return True if daily drop >= 5% (from first open to last close in df1d).
-    """
+    """Return True if daily drop >= 5% (from first open to last close)."""
     if df1d is None or len(df1d) < 2:
         return False
     first = df1d.iloc[0]["open"]
@@ -107,49 +128,41 @@ def check_daily_drop(df1d):
     return drop < -5
 
 
-def ema20_ema200_in_range_and_order(open_p, close_p, df_tf):
+def ema20_ema100_in_range_and_order(open_p, close_p, df_tf):
     """
-    Compute EMA20 and EMA200 on df_tf (same TF).
-    Check both lie inside [min(open,close), max(open,close)] and EMA20 < EMA200.
-    Return (True, ema20_val, ema200_val) or (False, None, None)
+    Compute EMA20 and EMA100 on df_tf (same TF).
+    Check both lie inside [min(open,close), max(open,close)] and EMA20 < EMA100.
+    Return (True, ema20_val, ema100_val) or (False, None, None)
     """
     if df_tf is None:
         return False, None, None
-    # need at least 200 candles for EMA200 to be meaningful
-    if len(df_tf) < 200:
+    if len(df_tf) < 100:  # need enough candles for EMA100
         return False, None, None
 
     d = df_tf.copy()
-    # exponential moving averages
     d["ema20"] = d["close"].ewm(span=20, adjust=False).mean()
-    d["ema200"] = d["close"].ewm(span=200, adjust=False).mean()
+    d["ema100"] = d["close"].ewm(span=100, adjust=False).mean()
     ema20 = d.iloc[-1]["ema20"]
-    ema200 = d.iloc[-1]["ema200"]
-    if pd.isna(ema20) or pd.isna(ema200):
+    ema100 = d.iloc[-1]["ema100"]
+    if pd.isna(ema20) or pd.isna(ema100):
         return False, None, None
 
     lo = min(open_p, close_p)
     hi = max(open_p, close_p)
-    if (lo <= ema20 <= hi) and (lo <= ema200 <= hi) and (ema20 < ema200):
-        return True, float(ema20), float(ema200)
+    if (lo <= ema20 <= hi) and (lo <= ema100 <= hi) and (ema20 < ema100):
+        return True, float(ema20), float(ema100)
     return False, None, None
 
 
-# ---------------- PER-TIMEFRAME PROCESS ----------------
+# ---------------- Processor for a timeframe ----------------
 async def process_tf_for_exchange(exchange, name, tf_check, symbols):
     """
-    Process scanning for timeframe tf_check.
-    tf_check in {"15m","30m","1h"}.
-    For tf_check:
-      - TF15m -> MA calculated on 15m
-      - TF30m -> MA calculated on 30m
-      - TF1h  -> MA calculated on 1h
+    Process scanning for tf_check (one of '30m','1h','2h').
+    - fetch TF candles, detect engulfing, calculate EMA20 & EMA100 on same TF,
+      verify condition and send Telegram.
     """
     errors = 0
     sent = 0
-    # determine required MA timeframe (same as tf_check)
-    tf_ma = tf_check
-
     for symbol in symbols:
         try:
             # daily filter
@@ -158,7 +171,7 @@ async def process_tf_for_exchange(exchange, name, tf_check, symbols):
             if df1d is None or check_daily_drop(df1d):
                 continue
 
-            # fetch tf_check candles (we want the latest closed one)
+            # fetch tf_check candles (want latest closed candle)
             df_check = fetch_ohlcv_df(exchange, symbol, tf_check, 250)
             await safe_sleep(RATE_DELAY)
             if df_check is None or len(df_check) < 3:
@@ -168,37 +181,44 @@ async def process_tf_for_exchange(exchange, name, tf_check, symbols):
             if not engulf:
                 continue
 
-            # fetch same timeframe for EMA calculation
-            df_ma = fetch_ohlcv_df(exchange, symbol, tf_ma, 500)
+            # fetch same TF for EMA calculation
+            df_ma = fetch_ohlcv_df(exchange, symbol, tf_check, 500)
             await safe_sleep(RATE_DELAY)
             if df_ma is None:
                 continue
 
-            ok, ema20_val, ema200_val = ema20_ema200_in_range_and_order(open_c, close_c, df_ma)
+            ok, ema20_val, ema100_val = ema20_ema100_in_range_and_order(open_c, close_c, df_ma)
             if not ok:
                 continue
 
-            # unique id: tf-exchange-symbol-timestamp
-            sig_id = f"{tf_check}-{name}-{symbol}-{int(pd.Timestamp(close_t).timestamp())}"
-            if sig_id in sent_signals:
+            # unique id: tf-exchange-symbol-close_ts
+            close_ts = int(pd.Timestamp(close_t).timestamp())
+            sig_id = f"{tf_check}-{symbol}-{close_ts}"
+            # check persistent sent_signals mapping
+            sym_record = sent_signals.get(symbol, {})
+            prev_ts = sym_record.get(tf_check)
+            if prev_ts == close_ts:
+                # already sent this exact candle
                 continue
 
-            sent_signals.add(sig_id)
-            sent += 1
-
-            # send telegram (rounded)
+            # send
             msg = (
-                f"✅ VALID SIGNAL\n"
+                "✅ VALID SIGNAL\n"
                 f"TF detected : {tf_check}\n"
                 f"Exchange    : {name}\n"
                 f"Pair        : {symbol}\n"
                 f"Open        : {open_c:.8f}\n"
                 f"Close       : {close_c:.8f}\n"
                 f"Candle UTC  : {close_t.isoformat()}\n"
-                f"EMA20 ({tf_ma}) = {ema20_val:.8f}\n"
-                f"EMA200({tf_ma}) = {ema200_val:.8f}\n"
+                f"EMA20 ({tf_check}) = {ema20_val:.8f}\n"
+                f"EMA100({tf_check}) = {ema100_val:.8f}\n"
             )
             await send_telegram(msg)
+
+            # persist sent signal
+            sent_signals.setdefault(symbol, {})[tf_check] = close_ts
+            save_sent_signals(sent_signals)
+            sent += 1
 
         except Exception:
             errors += 1
@@ -209,66 +229,61 @@ async def process_tf_for_exchange(exchange, name, tf_check, symbols):
         logging.warning(f"{name} {tf_check}: {sent} signals sent.")
 
 
-# ---------------- SCHEDULER & MAIN LOOP ----------------
+# ---------------- Scheduler & Main Loop ----------------
 async def main():
-    # run forever
+    # main loop: check every SLEEP_GRANULARITY seconds; trigger processing when candle close + WAIT_AFTER_CLOSE reached
     while True:
         utc = now_utc()
         minute = utc.minute
         second = utc.second
-
-        # Determine due timeframes (require WAIT_AFTER_CLOSE seconds passed since candle close)
         due = []
 
+        # only run a TF after WAIT_AFTER_CLOSE seconds since the close time
         if second >= WAIT_AFTER_CLOSE:
-            if minute % 15 == 0:
-                # 15m close
-                close_ts_15 = int(utc.replace(second=0, microsecond=0).timestamp()) - (utc.minute % 15) * 60
-                if last_processed["15m"] != close_ts_15:
-                    due.append("15m")
-                    last_processed["15m"] = close_ts_15
-
+            # 30m: minute % 30 == 0
             if minute % 30 == 0:
-                close_ts_30 = int(utc.replace(second=0, microsecond=0).timestamp()) - (utc.minute % 30) * 60
-                if last_processed["30m"] != close_ts_30:
+                close_dt_30 = utc.replace(second=0, microsecond=0) - timedelta(minutes=(utc.minute % 30))
+                close_ts = int(close_dt_30.timestamp())
+                if last_processed["30m"] != close_ts:
                     due.append("30m")
-                    last_processed["30m"] = close_ts_30
+                    last_processed["30m"] = close_ts
 
+            # 1h: minute == 0
             if minute == 0:
-                close_ts_1h = int(utc.replace(minute=0, second=0, microsecond=0).timestamp())
-                if last_processed["1h"] != close_ts_1h:
+                close_dt_1h = utc.replace(minute=0, second=0, microsecond=0)
+                close_ts = int(close_dt_1h.timestamp())
+                if last_processed["1h"] != close_ts:
                     due.append("1h")
-                    last_processed["1h"] = close_ts_1h
+                    last_processed["1h"] = close_ts
 
-        # load markets once per loop for each exchange
+                # 2h: hour % 2 == 0 (every even hour)
+                if utc.hour % 2 == 0:
+                    close_dt_2h = close_dt_1h  # same time align
+                    close_ts = int(close_dt_2h.timestamp())
+                    if last_processed["2h"] != close_ts:
+                        due.append("2h")
+                        last_processed["2h"] = close_ts
+
+        # load markets once per loop (USDT perpetual symbols)
         try:
-            markets_usdm = exchange_usdm.load_markets()
-            symbols_usdm = [s for s in markets_usdm if s.endswith(("USDT", "USD"))]
+            markets = exchange_usdm.load_markets()
+            # pick symbols ending with /USDT (typical futures ticker)
+            symbols = [s for s in markets if s.endswith("/USDT")]
         except Exception as e:
-            logging.warning(f"Failed loading USDM markets: {e}")
-            symbols_usdm = []
+            logging.warning(f"Failed loading markets: {e}")
+            symbols = []
 
-        try:
-            markets_coinm = exchange_coinm.load_markets()
-            symbols_coinm = [s for s in markets_coinm if s.endswith(("USDT", "USD"))]
-        except Exception as e:
-            logging.warning(f"Failed loading COINM markets: {e}")
-            symbols_coinm = []
-
-        # process each due TF sequentially to reduce API pressure
+        # sequentially process each due TF (reduce API pressure)
         for tf in due:
-            if tf == "15m":
-                await process_tf_for_exchange(exchange_usdm, "USDⓈ-M", "15m", symbols_usdm)
-                await process_tf_for_exchange(exchange_coinm, "COIN-M", "15m", symbols_coinm)
-            elif tf == "30m":
-                await process_tf_for_exchange(exchange_usdm, "USDⓈ-M", "30m", symbols_usdm)
-                await process_tf_for_exchange(exchange_coinm, "COIN-M", "30m", symbols_coinm)
+            if tf == "30m":
+                await process_tf_for_exchange(exchange_usdm, "USDⓈ-M", "30m", symbols)
             elif tf == "1h":
-                await process_tf_for_exchange(exchange_usdm, "USDⓈ-M", "1h", symbols_usdm)
-                await process_tf_for_exchange(exchange_coinm, "COIN-M", "1h", symbols_coinm)
+                await process_tf_for_exchange(exchange_usdm, "USDⓈ-M", "1h", symbols)
+            elif tf == "2h":
+                await process_tf_for_exchange(exchange_usdm, "USDⓈ-M", "2h", symbols)
 
-        # small sleep and re-evaluate
-        await asyncio.sleep(5)
+        # small sleep before re-evaluating
+        await asyncio.sleep(SLEEP_GRANULARITY)
 
 
 if __name__ == "__main__":
