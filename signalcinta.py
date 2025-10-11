@@ -1,153 +1,169 @@
-# main.py
+# signalcinta.py
 """
-Bot scanner — Bullish & Bearish Engulfing + EMA20 & EMA200 (non-repainting)
-Timeframes: 30m (scan tiap 30m), 1h (tiap 1h), 2h (tiap 2h)
-Scans all Binance USDⓈ-M perpetual futures pairs.
-Filter:
-- Bullish skip kalau 1D turun ≥5%
-- Bearish skip kalau 1D naik ≥5%
+Binance Futures Scanner (USDⓈ-M)
+Bullish + Bearish Detection
+----------------------------------
+• Bullish valid: Candle hijau, EMA20 bawah & EMA100 atas
+• Bearish valid: Candle merah, EMA20 atas & EMA100 bawah
+• Bearish skip jika naik >5% di 1D
+----------------------------------
+TF Scan:
+- 30m : tiap 30 menit
+- 1h  : tiap 1 jam
+- 2h  : tiap 2 jam
+----------------------------------
+Telegram notif otomatis
 """
 
 import asyncio
-import logging
-from datetime import datetime
-import ccxt
+import aiohttp
 import pandas as pd
-from telegram import Bot
+import logging
+from datetime import datetime, timezone
+import math
+import os
 
-# === SETUP TELEGRAM ===
-API_KEY = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
-CHAT_ID = "7183177114"
+# === KONFIGURASI ===
+BINANCE_FUTURES_URL = "https://fapi.binance.com/fapi/v1"
+TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
+TELEGRAM_CHAT_ID = "7183177114"
 
-bot = Bot(API_KEY)
-exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+# logging Railway
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-sent_signals = set()
-logging.basicConfig(level=logging.INFO)
-
-
-# === HELPER ===
-def get_ohlcv(symbol, timeframe, limit=300):
-    """Ambil data OHLCV + hitung EMA20 & EMA200"""
-    try:
-        data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-        df["ema20"] = df["close"].ewm(span=20).mean()
-        df["ema200"] = df["close"].ewm(span=200).mean()
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        return df
-    except Exception as e:
-        logging.error(f"OHLCV error {symbol}-{timeframe}: {e}")
-        return None
+sent_signals = set()  # untuk mencegah sinyal berulang
 
 
-def get_daily_change(symbol):
-    """Hitung perubahan persen TF 1D"""
-    try:
-        df = get_ohlcv(symbol, "1d", 10)
-        if df is None:
-            return 0
-        first, last = df.iloc[0]["open"], df.iloc[-1]["close"]
-        change = (last - first) / first * 100
-        return change
-    except Exception as e:
-        logging.error(f"Daily change check error {symbol}: {e}")
-        return 0
+# === UTILITAS ===
+async def fetch_json(session, url, params=None):
+    for _ in range(3):
+        try:
+            async with session.get(url, params=params, timeout=10) as r:
+                if r.status == 200:
+                    return await r.json()
+        except Exception as e:
+            logging.warning(f"Retry fetch {url}: {e}")
+        await asyncio.sleep(1)
+    return None
 
 
-# === DETEKSI POLA ===
-def is_bullish_engulfing(c1, c2):
-    """Bullish Engulfing"""
-    return (c1["close"] < c1["open"]) and (c2["close"] > c2["open"]) and (c2["close"] > c1["open"]) and (c2["open"] < c1["close"])
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 
-def is_bearish_engulfing(c1, c2):
-    """Bearish Engulfing"""
-    return (c1["close"] > c1["open"]) and (c2["close"] < c2["open"]) and (c2["close"] < c1["open"]) and (c2["open"] > c1["close"])
+def is_bullish(row):
+    return row["close"] > row["open"]
 
 
-# === CEK VALIDASI EMA ===
-def is_valid_bullish(c2):
-    """EMA20 bawah & EMA200 atas"""
-    ema20, ema200 = c2["ema20"], c2["ema200"]
-    low, high = min(c2["open"], c2["close"]), max(c2["open"], c2["close"])
-    return ema20 >= low and ema200 <= high and ema20 < ema200
-
-
-def is_valid_bearish(c2):
-    """EMA20 atas & EMA200 bawah"""
-    ema20, ema200 = c2["ema20"], c2["ema200"]
-    low, high = min(c2["open"], c2["close"]), max(c2["open"], c2["close"])
-    return ema20 <= high and ema200 >= low and ema20 > ema200
+def is_bearish(row):
+    return row["close"] < row["open"]
 
 
 # === TELEGRAM ===
-async def send_telegram(msg: str):
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except Exception as e:
-        logging.error(f"Telegram error: {e}")
-
-
-# === SCAN ===
-async def scan_tf(timeframe: str):
-    markets = exchange.load_markets()
-    symbols = [s for s in markets if s.endswith("/USDT")]
-
-    for symbol in symbols:
+async def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    async with aiohttp.ClientSession() as session:
         try:
-            df = get_ohlcv(symbol, timeframe, 250)
-            if df is None or len(df) < 3:
-                continue
-
-            daily_change = get_daily_change(symbol)
-            c1, c2 = df.iloc[-3], df.iloc[-2]
-
-            # === BULLISH ===
-            if daily_change > -5:  # hanya skip kalau turun ≥5%
-                if is_bullish_engulfing(c1, c2) and is_valid_bullish(c2):
-                    signal_id = f"BULL-{symbol}-{timeframe}-{c2['time']}"
-                    if signal_id not in sent_signals:
-                        sent_signals.add(signal_id)
-                        msg = (
-                            f"🟢 **BULLISH SIGNAL {timeframe.upper()}**\n"
-                            f"Pair: {symbol}\n"
-                            f"Open: {c2['open']}\n"
-                            f"Close: {c2['close']}\n"
-                            f"EMA20: {c2['ema20']:.2f}\n"
-                            f"EMA200: {c2['ema200']:.2f}\n"
-                            f"Change 1D: {daily_change:.2f}%\n"
-                            f"Time (close): {c2['time']}"
-                        )
-                        await send_telegram(msg)
-
-            # === BEARISH ===
-            if daily_change < 5:  # skip kalau naik ≥5%
-                if is_bearish_engulfing(c1, c2) and is_valid_bearish(c2):
-                    signal_id = f"BEAR-{symbol}-{timeframe}-{c2['time']}"
-                    if signal_id not in sent_signals:
-                        sent_signals.add(signal_id)
-                        msg = (
-                            f"🔴 **BEARISH SIGNAL {timeframe.upper()}**\n"
-                            f"Pair: {symbol}\n"
-                            f"Open: {c2['open']}\n"
-                            f"Close: {c2['close']}\n"
-                            f"EMA20: {c2['ema20']:.2f}\n"
-                            f"EMA200: {c2['ema200']:.2f}\n"
-                            f"Change 1D: {daily_change:.2f}%\n"
-                            f"Time (close): {c2['time']}"
-                        )
-                        await send_telegram(msg)
-
+            await session.post(url, data=payload)
         except Exception as e:
-            logging.error(f"Error {symbol} ({timeframe}): {e}")
+            logging.error(f"Telegram error: {e}")
+
+
+# === GET SEMUA PAIR ===
+async def get_all_usdt_pairs():
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(session, f"{BINANCE_FUTURES_URL}/exchangeInfo")
+        if not data:
+            return []
+        return [s["symbol"] for s in data["symbols"] if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT"]
+
+
+# === GET DATA KLINE ===
+async def get_klines(symbol, interval, limit=200):
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_json(session, f"{BINANCE_FUTURES_URL}/klines",
+                                params={"symbol": symbol, "interval": interval, "limit": limit})
+        if not data:
+            return None
+
+    df = pd.DataFrame(data, columns=[
+        "time", "open", "high", "low", "close", "volume",
+        "_", "__", "___", "____", "_____", "______"
+    ], dtype=float)
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df[["time", "open", "high", "low", "close"]]
+
+
+# === SCAN TF ===
+async def scan_tf(tf):
+    pairs = await get_all_usdt_pairs()
+    logging.info(f"Scanning timeframe {tf} — total {len(pairs)} pairs")
+
+    tasks = [process_symbol(symbol, tf) for symbol in pairs]
+    await asyncio.gather(*tasks)
+
+
+# === PROSES PER SYMBOL ===
+async def process_symbol(symbol, tf):
+    try:
+        df = await get_klines(symbol, tf)
+        if df is None or len(df) < 100:
+            return
+
+        df["ema20"] = calc_ema(df["close"], 20)
+        df["ema100"] = calc_ema(df["close"], 100)
+
+        c = df.iloc[-1]  # candle terbaru
+        if math.isnan(c["ema20"]) or math.isnan(c["ema100"]):
+            return
+
+        # === BULLISH DETECTION ===
+        if is_bullish(c) and (c["ema20"] > c["open"]) and (c["ema20"] < c["close"]) and (c["ema100"] > c["open"]) and (c["ema100"] < c["close"]) and (c["ema20"] < c["ema100"]):
+            key = f"{symbol}_{tf}_bullish"
+            if key not in sent_signals:
+                sent_signals.add(key)
+                msg = (
+                    f"🟢 <b>BULLISH SIGNAL DETECTED</b>\n"
+                    f"Symbol: <b>{symbol}</b>\n"
+                    f"Timeframe: <b>{tf}</b>\n"
+                    f"Open: {c['open']:.4f} | Close: {c['close']:.4f}\n"
+                    f"EMA20: {c['ema20']:.4f} | EMA100: {c['ema100']:.4f}"
+                )
+                await send_telegram(msg)
+                logging.info(f"{symbol} bullish signal sent ({tf})")
+
+        # === BEARISH DETECTION ===
+        elif is_bearish(c) and (c["ema20"] < c["open"]) and (c["ema20"] > c["close"]) and (c["ema100"] < c["open"]) and (c["ema100"] > c["close"]) and (c["ema20"] > c["ema100"]):
+            # Cek 1D change > +5%
+            df1d = await get_klines(symbol, "1d", limit=2)
+            if df1d is not None and len(df1d) >= 2:
+                pchg = (df1d.iloc[-1]["close"] - df1d.iloc[-2]["close"]) / df1d.iloc[-2]["close"] * 100
+                if pchg > 5:
+                    logging.info(f"{symbol} skipped bearish (daily +{pchg:.2f}%)")
+                    return
+
+            key = f"{symbol}_{tf}_bearish"
+            if key not in sent_signals:
+                sent_signals.add(key)
+                msg = (
+                    f"🔴 <b>BEARISH SIGNAL DETECTED</b>\n"
+                    f"Symbol: <b>{symbol}</b>\n"
+                    f"Timeframe: <b>{tf}</b>\n"
+                    f"Open: {c['open']:.4f} | Close: {c['close']:.4f}\n"
+                    f"EMA20: {c['ema20']:.4f} | EMA100: {c['ema100']:.4f}"
+                )
+                await send_telegram(msg)
+                logging.info(f"{symbol} bearish signal sent ({tf})")
+
+    except Exception as e:
+        logging.warning(f"Error {symbol} {tf}: {e}")
 
 
 # === LOOP UTAMA ===
 async def main():
     while True:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         minute = now.minute
         hour = now.hour
 
@@ -161,7 +177,7 @@ async def main():
             tasks.append(scan_tf("2h"))
 
         if tasks:
-            logging.info(f"Mulai scanning timeframe aktif...")
+            logging.info("⏳ Mulai scanning timeframe aktif...")
             await asyncio.gather(*tasks)
 
         await asyncio.sleep(60)
