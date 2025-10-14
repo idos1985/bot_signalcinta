@@ -1,14 +1,13 @@
 # signalcinta.py
 """
-Final scanner (single-candle EMA20 & EMA100)
+Final signal scanner (single-candle EMA20/EMA100)
 - TF: 30m, 1h, 2h
-- Criteria (non-repainting, uses closed candle df.iloc[-2]):
-    * Bullish: closed green candle, EMA20 & EMA100 both inside the candle body, EMA20 < EMA100
-    * Bearish: closed red candle, EMA20 & EMA100 both inside the candle body, EMA20 > EMA100
+- Criteria (non-repainting):
+  * Bullish: last CLOSED candle is green, EMA20 & EMA100 both lie inside candle body, and EMA20 < EMA100
+  * Bearish: last CLOSED candle is red, EMA20 & EMA100 both lie inside candle body, and EMA20 > EMA100
 - Targets: Binance USDⓈ-M (USDT perpetual)
-- Skip: bearish if 1D rise >= 5%; bullish skip if 1D drop <= -5% (optional, but per earlier logic)
-- Persist sent signals to sent_signals.json to avoid duplicates across restarts
-- Telegram token/chat filled directly below (no env required)
+- Persistence: sent_signals.json to avoid duplicate notifications
+- Send Telegram via HTTP POST (fill TELEGRAM_TOKEN & TELEGRAM_CHAT_ID below)
 """
 
 import asyncio
@@ -21,25 +20,20 @@ import aiohttp
 import ccxt
 import pandas as pd
 
-# ---------------- CONFIG (Isi manual di sini) ----------------
+# ---------------- CONFIG - isi manual di sini ----------------
 TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 TELEGRAM_CHAT_ID = "7183177114"
 
-# Buffer after candle close (seconds) to avoid API lag
-WAIT_AFTER_CLOSE = 120
-
-# small pauses to reduce rate pressure
-RATE_DELAY = 0.12
-TF_SLEEP = 2  # seconds pause between TF runs
-LOOP_SLEEP = 6  # main loop sleep when nothing due
-
-SENT_FILE = "sent_signals.json"  # persistence
+WAIT_AFTER_CLOSE = 120         # seconds buffer after candle close
+RATE_DELAY = 0.12              # small pause between symbol processing
+LOOP_SLEEP = 6                 # how often main loop wakes (seconds)
+SENT_FILE = "sent_signals.json"  # persistence file
 
 # ---------------- logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("signalcinta")
 
-# ---------------- exchange (ccxt) ----------------
+# ---------------- exchange ----------------
 exchange = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
 
 # ---------------- persistence helpers ----------------
@@ -48,8 +42,8 @@ def load_sent_signals():
         try:
             with open(SENT_FILE, "r", encoding="utf8") as f:
                 return json.load(f)
-        except Exception as e:
-            logger.warning(f"Failed load sent signals: {e}")
+        except Exception:
+            return {}
     return {}
 
 def save_sent_signals(data):
@@ -57,27 +51,27 @@ def save_sent_signals(data):
         with open(SENT_FILE, "w", encoding="utf8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        logger.warning(f"Failed save sent signals: {e}")
+        logger.warning(f"Failed saving sent signals: {e}")
 
-sent_signals = load_sent_signals()  # { "BTC/USDT": { "30m": ts, ... } }
+sent_signals = load_sent_signals()  # structure: { "BTC/USDT": {"30m": ts, "1h": ts, ...} }
 
-# ---------------- Telegram sender ----------------
+# ---------------- networking (Telegram) ----------------
 async def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram token/chat id not set. Skipping send.")
+        logger.warning("Telegram token / chat id not set — skipping send.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=payload, timeout=15) as resp:
                 if resp.status != 200:
-                    txt = await resp.text()
-                    logger.warning(f"Telegram returned {resp.status}: {txt}")
+                    body = await resp.text()
+                    logger.warning(f"Telegram returned {resp.status}: {body}")
     except Exception as e:
-        logger.warning(f"Telegram send error: {e}")
+        logger.warning(f"Telegram error: {e}")
 
-# ---------------- ccxt wrappers (blocking calls in thread) ----------------
+# ---------------- ccxt wrappers (run sync calls in threads) ----------------
 def _load_markets_sync():
     return exchange.load_markets()
 
@@ -88,6 +82,9 @@ def _fetch_ohlcv_sync(symbol: str, timeframe: str, limit: int):
     return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 async def fetch_ohlcv_df(symbol: str, timeframe: str, limit: int = 500):
+    """
+    Returns DataFrame indexed by tz-aware UTC time, or None on failure.
+    """
     try:
         data = await asyncio.to_thread(_fetch_ohlcv_sync, symbol, timeframe, limit)
         if not data:
@@ -95,8 +92,7 @@ async def fetch_ohlcv_df(symbol: str, timeframe: str, limit: int = 500):
         df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         df = df.set_index("time")
-        # ensure floats
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df = df.astype(float)
         return df
     except Exception as e:
         logger.debug(f"fetch_ohlcv_df error {symbol} {timeframe}: {e}")
@@ -109,26 +105,26 @@ def compute_emas(df: pd.DataFrame):
     d["ema100"] = d["close"].ewm(span=100, adjust=False).mean()
     return d
 
-def detect_single_candle(df: pd.DataFrame):
+def detect_single_candle_signal(df: pd.DataFrame):
     """
-    Use closed candle df.iloc[-2] (non-repainting).
-    Return (signal_type, open, close, close_time, ema20, ema100) or (None,...)
+    Evaluate the last CLOSED candle (df.iloc[-2]) and EMA values at that moment.
+    Returns (signal_type, open, close, close_time, ema20, ema100) or (None, ...).
     """
-    if df is None or len(df) < 120:
+    if df is None or len(df) < 120:   # need enough history for EMA100
         return None, None, None, None, None, None
 
     d = compute_emas(df)
-    sig = d.iloc[-2]  # candle that just closed
+    sig = d.iloc[-2]   # the candle that just closed
     open_p = float(sig["open"])
     close_p = float(sig["close"])
     ema20 = float(sig["ema20"])
     ema100 = float(sig["ema100"])
-    close_time = sig.name  # tz-aware Timestamp
+    close_time = sig.name  # tz-aware
 
     lo = min(open_p, close_p)
     hi = max(open_p, close_p)
 
-    # both EMAs must be inside the candle body [lo, hi]
+    # both EMAs must be inside the candle body
     if not (lo <= ema20 <= hi and lo <= ema100 <= hi):
         return None, None, None, None, None, None
 
@@ -142,17 +138,22 @@ def detect_single_candle(df: pd.DataFrame):
 
     return None, None, None, None, None, None
 
-# ---------------- daily change helper ----------------
-async def daily_change_pct(symbol: str):
+# ---------------- daily change ----------------
+async def get_daily_change_pct(symbol: str):
     df = await fetch_ohlcv_df(symbol, "1d", limit=10)
     if df is None or len(df) < 2:
         return 0.0
     first_open = float(df.iloc[0]["open"])
     last_close = float(df.iloc[-1]["close"])
-    return (last_close - first_open) / first_open * 100
+    change = (last_close - first_open) / first_open * 100
+    return change
 
 # ---------------- symbol filter ----------------
 def filter_usdt_perpetual(markets_dict):
+    """
+    From ccxt exchange.load_markets() dictionary, return list of perpetual USDT futures symbols.
+    We check meta info['info']['contractType'] == 'PERPETUAL' and symbol endswith '/USDT'.
+    """
     syms = []
     for sym, meta in markets_dict.items():
         try:
@@ -163,7 +164,7 @@ def filter_usdt_perpetual(markets_dict):
             continue
     return syms
 
-# ---------------- per-symbol processing ----------------
+# ---------------- process per symbol ----------------
 async def process_symbol(symbol: str, tf: str):
     try:
         df = await fetch_ohlcv_df(symbol, tf, limit=300)
@@ -171,24 +172,22 @@ async def process_symbol(symbol: str, tf: str):
         if df is None or len(df) < 120:
             return
 
-        sig_type, open_p, close_p, close_time, ema20, ema100 = detect_single_candle(df)
+        sig_type, open_p, close_p, close_time, ema20, ema100 = detect_single_candle_signal(df)
         if sig_type is None:
             return
 
-        # daily filter
-        dchg = await daily_change_pct(symbol)
-        # Skip bearish if 1D rise >= 5%
-        if sig_type == "bearish" and dchg > 5:
-            return
-        # Skip bullish if 1D drop <= -5% (as earlier logic sometimes used)
+        # daily filter: bullish skip if 1D drop >=5%; bearish skip if 1D rise >=5%
+        dchg = await get_daily_change_pct(symbol)
         if sig_type == "bullish" and dchg < -5:
+            return
+        if sig_type == "bearish" and dchg > 5:
             return
 
         close_ts = int(pd.Timestamp(close_time).timestamp())
         rec = sent_signals.get(symbol, {})
         prev_ts = rec.get(tf)
         if prev_ts == close_ts:
-            return  # already sent this candle tf
+            return  # already sent for this candle
 
         # prepare message
         header = "🟢 VALID BULLISH SIGNAL" if sig_type == "bullish" else "🔴 VALID BEARISH SIGNAL"
@@ -206,7 +205,7 @@ async def process_symbol(symbol: str, tf: str):
 
         await send_telegram(msg)
 
-        # persist
+        # persist and log
         sent_signals.setdefault(symbol, {})[tf] = close_ts
         save_sent_signals(sent_signals)
         logger.info(f"Sent {sig_type} for {symbol} {tf} at {close_time.isoformat()}")
@@ -221,7 +220,9 @@ async def scan_symbols_for_tf(symbols, tf):
         await process_symbol(sym, tf)
 
 def compute_close_dt(now: datetime, tf: str) -> datetime:
-    # now must be timezone-aware UTC
+    """
+    Compute the most recent closed candle datetime (UTC) for given timeframe.
+    """
     if tf == "30m":
         minute = now.minute
         close_min = 30 * (minute // 30)
@@ -244,7 +245,7 @@ def compute_close_dt(now: datetime, tf: str) -> datetime:
 
 async def main_loop():
     logger.info(f"Scanner started — WAIT_AFTER_CLOSE={WAIT_AFTER_CLOSE}s")
-    last_processed_local = {"30m": None, "1h": None, "2h": None}
+    last_processed = {"30m": None, "1h": None, "2h": None}
     while True:
         now = datetime.now(timezone.utc)
         due = []
@@ -252,11 +253,12 @@ async def main_loop():
         for tf in ["30m", "1h", "2h"]:
             close_dt = compute_close_dt(now, tf)
             close_ts = int(close_dt.timestamp())
-            if now >= (close_dt + timedelta(seconds=WAIT_AFTER_CLOSE)) and last_processed_local.get(tf) != close_ts:
-                last_processed_local[tf] = close_ts
+            if now >= (close_dt + timedelta(seconds=WAIT_AFTER_CLOSE)) and last_processed.get(tf) != close_ts:
+                last_processed[tf] = close_ts
                 due.append((tf, close_dt))
 
         if due:
+            # load and filter markets once
             try:
                 markets = await load_markets_async()
                 symbols = filter_usdt_perpetual(markets)
@@ -270,7 +272,7 @@ async def main_loop():
             for tf, close_dt in due:
                 logger.info(f"⏳ Scanning timeframe {tf} for close {close_dt.isoformat()} (UTC) ...")
                 await scan_symbols_for_tf(symbols, tf)
-                await asyncio.sleep(TF_SLEEP)
+                await asyncio.sleep(2)
 
         await asyncio.sleep(LOOP_SLEEP)
 
