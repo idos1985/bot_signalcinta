@@ -1,18 +1,14 @@
-"""
-🚀 FINAL VERSION — Bullish & Bearish Engulfing (EMA-based)
-===========================================================
-Timeframes: 30m / 1h / 2h
-Kriteria valid:
-✅ Bullish Engulfing: 1 candle hijau terakhir menelan 2 candle merah sebelumnya
-   - EMA20 di bawah candle terakhir
-   - EMA100 di atas candle terakhir
-✅ Bearish Engulfing: 1 candle merah terakhir menelan 2 candle hijau sebelumnya
-   - EMA20 di atas candle terakhir
-   - EMA100 di bawah candle terakhir
-EMA dihitung real-time sampai close candle terakhir
-Scan semua pair Binance Futures (USDT-M)
-Scan tiap 30m, 1h, dan 2h (dengan delay 1 menit setelah candle close)
-"""
+# ============================================================
+# 🚀 Simple Engulfing Detector — MA20 & MA100 (EMA)
+# ============================================================
+# 🔹 Scan semua pair USDT di Binance Futures (USDT-M)
+# 🔹 Timeframe: 30m / 1h / 2h
+# 🔹 Bullish: Engulfing hijau menembus MA20(bawah) & MA100(atas)
+# 🔹 Bearish: Engulfing merah menembus MA20(atas) & MA100(bawah)
+# 🔹 Scan otomatis tiap 30m, 1h, 2h
+# 🔹 Tunggu 1 menit setelah candle close agar MA terbaru sudah valid
+# 🔹 Hanya kirim sinyal baru (1x per candle)
+# ============================================================
 
 import asyncio
 import logging
@@ -21,33 +17,32 @@ import pandas as pd
 import ccxt
 from telegram import Bot
 
-# ===========================
-# 🔧 KONFIG TELEGRAM
-# ===========================
-API_KEY = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
+# ==========================
+# 🔧 KONFIGURASI TELEGRAM
+# ==========================
+TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 CHAT_ID = "7183177114"
-bot = Bot(API_KEY)
+bot = Bot(token=TELEGRAM_TOKEN)
 
-# ===========================
-# 🔧 SETUP BINANCE FUTURES
-# ===========================
+# ==========================
+# 🔧 BINANCE FUTURES
+# ==========================
 exchange = ccxt.binance({
     "enableRateLimit": True,
-    "options": {"defaultType": "future"}  # hanya USDT perpetual
+    "options": {"defaultType": "future"}  # USDT-M
 })
 
-# ===========================
-# ⚙️ VARIABEL GLOBAL
-# ===========================
-sent_signals = set()
-last_candle_time = {}
+# ==========================
+# 🧠 SETUP
+# ==========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+sent = {}  # {(symbol, tf): last_candle_time}
 
 
-# ===========================
-# 📊 HELPER FUNCTIONS
-# ===========================
-def get_ohlcv_df(symbol, tf, limit=200):
+# ==========================
+# 🔹 FUNGSI BANTUAN
+# ==========================
+def get_ohlcv(symbol, tf, limit=200):
     """Ambil data OHLCV"""
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
@@ -55,131 +50,105 @@ def get_ohlcv_df(symbol, tf, limit=200):
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
         df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
         return df
-    except Exception as e:
-        logging.error(f"Fetch error {symbol}-{tf}: {e}")
+    except:
         return None
 
 
 def ema(series, period):
-    """Hitung EMA"""
     return series.ewm(span=period, adjust=False).mean()
 
 
-def daily_change_skip(df):
-    """Skip jika 1D naik/turun ≥5%"""
-    if df is None or len(df) < 2:
-        return False
-    change = (df.iloc[-1]["close"] - df.iloc[0]["open"]) / df.iloc[0]["open"] * 100
-    return abs(change) >= 5
+def is_bullish_engulfing(df):
+    prev, last = df.iloc[-2], df.iloc[-1]
+    return (
+        last["close"] > last["open"] and
+        prev["close"] < prev["open"] and
+        last["close"] > prev["open"] and
+        last["open"] < prev["close"]
+    )
 
 
-def detect_engulfing_with_ema(df):
-    """Deteksi Bullish/Bearish Engulfing yang valid terhadap EMA20 & EMA100"""
-    if len(df) < 5:
-        return None
-
-    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    ema20_now = ema(df["close"], 20).iloc[-1]
-    ema100_now = ema(df["close"], 100).iloc[-1]
-
-    # === BULLISH ENGULFING ===
-    if c3["close"] > c3["open"] and c1["close"] < c1["open"] and c2["close"] < c2["open"]:
-        if c3["close"] > c1["open"] and c3["open"] < c1["close"]:
-            # Validasi posisi EMA
-            if ema20_now > c3["low"] and ema20_now < c3["high"] and ema100_now > c3["close"]:
-                return "BULLISH", ema20_now, ema100_now
-
-    # === BEARISH ENGULFING ===
-    if c3["close"] < c3["open"] and c1["close"] > c1["open"] and c2["close"] > c2["open"]:
-        if c3["open"] > c1["close"] and c3["close"] < c1["open"]:
-            if ema20_now < c3["high"] and ema20_now > c3["low"] and ema100_now < c3["close"]:
-                return "BEARISH", ema20_now, ema100_now
-
-    return None
+def is_bearish_engulfing(df):
+    prev, last = df.iloc[-2], df.iloc[-1]
+    return (
+        last["close"] < last["open"] and
+        prev["close"] > prev["open"] and
+        last["open"] > prev["close"] and
+        last["close"] < prev["open"]
+    )
 
 
-async def send_telegram(msg):
-    """Kirim pesan ke Telegram"""
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except Exception as e:
-        logging.error(f"Telegram error: {e}")
+# ==========================
+# 🔁 PROSES SCAN
+# ==========================
+async def scan(tf, interval_min):
+    """Scan timeframe tertentu"""
+    await asyncio.sleep(60)  # tunggu 1 menit setelah candle close
 
-
-# ===========================
-# 🔁 SCANNER LOOP
-# ===========================
-async def scan_timeframe(tf, interval_minutes):
-    """Scan setiap timeframe"""
-    logging.info(f"✅ Mulai scanner TF {tf} setiap {interval_minutes}+1 menit")
+    symbols = [s for s in exchange.load_markets() if s.endswith("USDT")]
 
     while True:
-        try:
-            markets = exchange.load_markets()
-            symbols = [s for s in markets if s.endswith("USDT")]
-        except Exception as e:
-            logging.error(f"Gagal load markets: {e}")
-            symbols = []
-
-        logging.info(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 🔍 Scan {len(symbols)} pair — TF {tf}")
+        logging.info(f"🔍 Scan {len(symbols)} pair — TF {tf}")
 
         for symbol in symbols:
             try:
-                df = get_ohlcv_df(symbol, tf, limit=200)
-                if df is None or len(df) < 120:
-                    continue
-
-                # Skip pair dengan perubahan 1D ekstrem
-                df1d = get_ohlcv_df(symbol, "1d", limit=10)
-                if df1d is not None and daily_change_skip(df1d):
+                df = get_ohlcv(symbol, tf, 200)
+                if df is None or len(df) < 2:
                     continue
 
                 last_time = df.iloc[-1]["time"]
-                key = f"{tf}|{symbol}"
-                prev_time = last_candle_time.get(key)
+                if (symbol, tf) in sent and sent[(symbol, tf)] == last_time:
+                    continue  # skip candle yang sudah dikirim
 
-                # Hanya proses candle baru
-                if prev_time is not None and last_time <= prev_time:
-                    continue
-                last_candle_time[key] = last_time
+                ema20 = ema(df["close"], 20)
+                ema100 = ema(df["close"], 100)
+                ema20_now = ema20.iloc[-1]
+                ema100_now = ema100.iloc[-1]
+                last = df.iloc[-1]
 
-                result = detect_engulfing_with_ema(df)
-                if not result:
-                    continue
+                # === BULLISH ENGULFING ===
+                if is_bullish_engulfing(df):
+                    if last["open"] > ema20_now and last["close"] > ema100_now and ema20_now < ema100_now:
+                        msg = (
+                            f"🟢 [BULLISH ENGULFING]\n"
+                            f"Pair: {symbol}\n"
+                            f"Timeframe: {tf}\n"
+                            f"Time: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                            f"MA20: {ema20_now:.4f} | MA100: {ema100_now:.4f}"
+                        )
+                        await bot.send_message(chat_id=CHAT_ID, text=msg)
+                        sent[(symbol, tf)] = last_time
+                        logging.info(f"BULLISH {symbol} {tf}")
 
-                signal, ema20_val, ema100_val = result
-                signal_id = f"{symbol}|{tf}|{last_time.isoformat()}|{signal}"
-                if signal_id in sent_signals:
-                    continue
-                sent_signals.add(signal_id)
-
-                msg = (
-                    f"📊 [{signal}] Engulfing Signal\n"
-                    f"Pair: {symbol}\n"
-                    f"Timeframe: {tf}\n"
-                    f"Time: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                    f"EMA20: {ema20_val:.8f}\n"
-                    f"EMA100: {ema100_val:.8f}\n"
-                )
-                await send_telegram(msg)
-                logging.info(f"✅ {signal} {symbol} {tf} @ {last_time}")
+                # === BEARISH ENGULFING ===
+                elif is_bearish_engulfing(df):
+                    if last["open"] < ema20_now and last["close"] < ema100_now and ema20_now > ema100_now:
+                        msg = (
+                            f"🔴 [BEARISH ENGULFING]\n"
+                            f"Pair: {symbol}\n"
+                            f"Timeframe: {tf}\n"
+                            f"Time: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                            f"MA20: {ema20_now:.4f} | MA100: {ema100_now:.4f}"
+                        )
+                        await bot.send_message(chat_id=CHAT_ID, text=msg)
+                        sent[(symbol, tf)] = last_time
+                        logging.info(f"BEARISH {symbol} {tf}")
 
             except Exception as e:
-                logging.error(f"Error {symbol} {tf}: {e}")
+                logging.error(f"{symbol} {tf} error: {e}")
 
-        # Delay 1 menit agar candle benar-benar close sempurna
-        logging.info(f"⏸ Selesai scan TF {tf}. Tidur {interval_minutes}+1 menit...\n")
-        await asyncio.sleep(interval_minutes * 60 + 60)
+        logging.info(f"⏸ Tunggu {interval_min} menit...\n")
+        await asyncio.sleep(interval_min * 60)
 
 
-# ===========================
-# 🚀 MAIN PROGRAM
-# ===========================
+# ==========================
+# 🚀 MAIN
+# ==========================
 async def main():
     tasks = [
-        asyncio.create_task(scan_timeframe("30m", 30)),
-        asyncio.create_task(scan_timeframe("1h", 60)),
-        asyncio.create_task(scan_timeframe("2h", 120)),
+        asyncio.create_task(scan("30m", 30)),
+        asyncio.create_task(scan("1h", 60)),
+        asyncio.create_task(scan("2h", 120)),
     ]
     await asyncio.gather(*tasks)
 
