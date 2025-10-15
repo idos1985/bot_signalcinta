@@ -1,15 +1,17 @@
-# main.py
 """
-Bullish/Bearish Engulfing Detector (EMA20/EMA100) — Multi TF
-Delay 1 menit agar candle & EMA sudah terbentuk sempurna.
-
-- Exchange: Binance Futures (USDT-M)
-- Timeframes: 30m, 1h, 2h
-- Scan intervals: 31m, 61m, 121m (delay +1m)
-- EMA20 / EMA100: exponential, dihitung sampai candle terakhir (baru close)
-- Engulfing: candle terakhir menelan 2 candle sebelumnya
-- Skip jika daily change >= 5%
-- Kirim notifikasi ke Telegram
+🚀 FINAL VERSION — Bullish & Bearish Engulfing (EMA-based)
+===========================================================
+Timeframes: 30m / 1h / 2h
+Kriteria valid:
+✅ Bullish Engulfing: 1 candle hijau terakhir menelan 2 candle merah sebelumnya
+   - EMA20 di bawah candle terakhir
+   - EMA100 di atas candle terakhir
+✅ Bearish Engulfing: 1 candle merah terakhir menelan 2 candle hijau sebelumnya
+   - EMA20 di atas candle terakhir
+   - EMA100 di bawah candle terakhir
+EMA dihitung real-time sampai close candle terakhir
+Scan semua pair Binance Futures (USDT-M)
+Scan tiap 30m, 1h, dan 2h (dengan delay 1 menit setelah candle close)
 """
 
 import asyncio
@@ -20,144 +22,114 @@ import ccxt
 from telegram import Bot
 
 # ===========================
-# 🔧 CONFIG TELEGRAM
+# 🔧 KONFIG TELEGRAM
 # ===========================
 API_KEY = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 CHAT_ID = "7183177114"
 bot = Bot(API_KEY)
 
 # ===========================
-# 🔧 BINANCE FUTURES SETUP
+# 🔧 SETUP BINANCE FUTURES
 # ===========================
 exchange = ccxt.binance({
     "enableRateLimit": True,
-    "options": {"defaultType": "future"}  # USDT-M futures
+    "options": {"defaultType": "future"}  # hanya USDT perpetual
 })
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-
+# ===========================
+# ⚙️ VARIABEL GLOBAL
+# ===========================
 sent_signals = set()
 last_candle_time = {}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 # ===========================
-# 🔧 HELPER FUNCTIONS
+# 📊 HELPER FUNCTIONS
 # ===========================
-def get_ohlcv_df(symbol: str, timeframe: str, limit: int = 500):
-    """Fetch OHLCV and return pandas DataFrame."""
+def get_ohlcv_df(symbol, tf, limit=200):
+    """Ambil data OHLCV"""
     try:
-        data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
         df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
         return df
     except Exception as e:
-        logging.error(f"fetch_ohlcv error {symbol} {timeframe}: {e}")
+        logging.error(f"Fetch error {symbol}-{tf}: {e}")
         return None
 
 
-def daily_change_skip(df1d: pd.DataFrame):
-    """Return True if abs daily change >= 5% (skip pair)."""
-    if df1d is None or len(df1d) < 2:
-        return False
-    change = (df1d.iloc[-1]["close"] - df1d.iloc[0]["open"]) / df1d.iloc[0]["open"] * 100
-    return abs(change) >= 5
-
-
-def ema(series: pd.Series, period: int):
-    """Exponential moving average (EMA)."""
+def ema(series, period):
+    """Hitung EMA"""
     return series.ewm(span=period, adjust=False).mean()
 
 
-def engulfing_two_prev(df: pd.DataFrame):
-    """Deteksi engulfing yang menelan 2 candle sebelumnya."""
-    if df is None or len(df) < 4:
+def daily_change_skip(df):
+    """Skip jika 1D naik/turun ≥5%"""
+    if df is None or len(df) < 2:
+        return False
+    change = (df.iloc[-1]["close"] - df.iloc[0]["open"]) / df.iloc[0]["open"] * 100
+    return abs(change) >= 5
+
+
+def detect_engulfing_with_ema(df):
+    """Deteksi Bullish/Bearish Engulfing yang valid terhadap EMA20 & EMA100"""
+    if len(df) < 5:
         return None
 
-    prev2 = df.iloc[-3]
-    prev1 = df.iloc[-2]
-    last  = df.iloc[-1]
+    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+    ema20_now = ema(df["close"], 20).iloc[-1]
+    ema100_now = ema(df["close"], 100).iloc[-1]
 
-    body_low_prev = min(prev1["open"], prev1["close"], prev2["open"], prev2["close"])
-    body_high_prev = max(prev1["open"], prev1["close"], prev2["open"], prev2["close"])
+    # === BULLISH ENGULFING ===
+    if c3["close"] > c3["open"] and c1["close"] < c1["open"] and c2["close"] < c2["open"]:
+        if c3["close"] > c1["open"] and c3["open"] < c1["close"]:
+            # Validasi posisi EMA
+            if ema20_now > c3["low"] and ema20_now < c3["high"] and ema100_now > c3["close"]:
+                return "BULLISH", ema20_now, ema100_now
 
-    open_last = last["open"]
-    close_last = last["close"]
-
-    # Bullish engulfing
-    if (prev1["close"] < prev1["open"]) and (prev2["close"] < prev2["open"]):
-        if (close_last > open_last) and (open_last <= body_low_prev) and (close_last >= body_high_prev):
-            return "BULLISH"
-
-    # Bearish engulfing
-    if (prev1["close"] > prev1["open"]) and (prev2["close"] > prev2["open"]):
-        if (close_last < open_last) and (open_last >= body_high_prev) and (close_last <= body_low_prev):
-            return "BEARISH"
+    # === BEARISH ENGULFING ===
+    if c3["close"] < c3["open"] and c1["close"] > c1["open"] and c2["close"] > c2["open"]:
+        if c3["open"] > c1["close"] and c3["close"] < c1["open"]:
+            if ema20_now < c3["high"] and ema20_now > c3["low"] and ema100_now < c3["close"]:
+                return "BEARISH", ema20_now, ema100_now
 
     return None
 
 
-def detect_engulfing_with_ema(df: pd.DataFrame):
-    """Deteksi pola engulfing + validasi EMA20 & EMA100."""
-    if df is None or len(df) < 110:
-        return None
-
-    last = df.iloc[-1]
-    ema20 = ema(df["close"], 20).iloc[-1]
-    ema100 = ema(df["close"], 100).iloc[-1]
-
-    if pd.isna(ema20) or pd.isna(ema100):
-        return None
-
-    open_last = last["open"]
-    close_last = last["close"]
-    low_body = min(open_last, close_last)
-    high_body = max(open_last, close_last)
-
-    engulf = engulfing_two_prev(df)
-    if engulf == "BULLISH":
-        if (ema20 > low_body) and (ema20 < high_body) and (ema100 > high_body):
-            return "BULLISH", ema20, ema100
-    elif engulf == "BEARISH":
-        if (ema20 > low_body) and (ema20 < high_body) and (ema100 < low_body):
-            return "BEARISH", ema20, ema100
-
-    return None
-
-
-async def send_telegram(msg: str):
-    """Kirim pesan ke Telegram."""
+async def send_telegram(msg):
+    """Kirim pesan ke Telegram"""
     try:
         await bot.send_message(chat_id=CHAT_ID, text=msg)
-    except TypeError:
-        try:
-            bot.send_message(chat_id=CHAT_ID, text=msg)
-        except Exception as e:
-            logging.error(f"Telegram send error (sync fallback): {e}")
     except Exception as e:
-        logging.error(f"Telegram send error: {e}")
+        logging.error(f"Telegram error: {e}")
+
 
 # ===========================
 # 🔁 SCANNER LOOP
 # ===========================
-async def scan_timeframe(tf: str, interval_minutes: int):
-    logging.info(f"Scanner started for TF {tf} (every {interval_minutes}+1 min)")
+async def scan_timeframe(tf, interval_minutes):
+    """Scan setiap timeframe"""
+    logging.info(f"✅ Mulai scanner TF {tf} setiap {interval_minutes}+1 menit")
+
     while True:
         try:
             markets = exchange.load_markets()
-            symbols = [s for s in markets.keys() if s.endswith("USDT")]
+            symbols = [s for s in markets if s.endswith("USDT")]
         except Exception as e:
-            logging.error(f"load_markets failed: {e}")
+            logging.error(f"Gagal load markets: {e}")
             symbols = []
 
-        logging.info(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 🔍 Scanning {len(symbols)} pairs — TF {tf}")
+        logging.info(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 🔍 Scan {len(symbols)} pair — TF {tf}")
 
         for symbol in symbols:
             try:
-                df = get_ohlcv_df(symbol, tf, limit=500)
+                df = get_ohlcv_df(symbol, tf, limit=200)
                 if df is None or len(df) < 120:
                     continue
 
-                # Skip jika volatilitas 1D terlalu tinggi
+                # Skip pair dengan perubahan 1D ekstrem
                 df1d = get_ohlcv_df(symbol, "1d", limit=10)
                 if df1d is not None and daily_change_skip(df1d):
                     continue
@@ -166,51 +138,42 @@ async def scan_timeframe(tf: str, interval_minutes: int):
                 key = f"{tf}|{symbol}"
                 prev_time = last_candle_time.get(key)
 
-                # hanya proses jika candle baru close
+                # Hanya proses candle baru
                 if prev_time is not None and last_time <= prev_time:
                     continue
                 last_candle_time[key] = last_time
 
-                res = detect_engulfing_with_ema(df)
-                if not res:
+                result = detect_engulfing_with_ema(df)
+                if not result:
                     continue
-                signal, ema20_val, ema100_val = res
 
+                signal, ema20_val, ema100_val = result
                 signal_id = f"{symbol}|{tf}|{last_time.isoformat()}|{signal}"
                 if signal_id in sent_signals:
                     continue
                 sent_signals.add(signal_id)
 
-                open_last = df.iloc[-1]["open"]
-                close_last = df.iloc[-1]["close"]
-                last_time_str = last_time.strftime("%Y-%m-%d %H:%M UTC")
-
-                if signal == "BULLISH":
-                    note = "Bullish Engulfing (menelan 2 merah)\nEMA20 di antara open-close\nEMA100 di atas candle"
-                else:
-                    note = "Bearish Engulfing (menelan 2 hijau)\nEMA20 di antara open-close\nEMA100 di bawah candle"
-
                 msg = (
-                    f"📊 [{signal}] {symbol} (TF {tf})\n"
-                    f"Time: {last_time_str}\n"
-                    f"Open: {open_last:.8g} | Close: {close_last:.8g}\n"
-                    f"EMA20: {ema20_val:.8g} | EMA100: {ema100_val:.8g}\n"
-                    f"{note}"
+                    f"📊 [{signal}] Engulfing Signal\n"
+                    f"Pair: {symbol}\n"
+                    f"Timeframe: {tf}\n"
+                    f"Time: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                    f"EMA20: {ema20_val:.8f}\n"
+                    f"EMA100: {ema100_val:.8f}\n"
                 )
-
                 await send_telegram(msg)
-                logging.info(f"✅ Sent {signal} for {symbol} {tf} @ {last_time_str}")
+                logging.info(f"✅ {signal} {symbol} {tf} @ {last_time}")
 
             except Exception as e:
-                logging.error(f"Error processing {symbol} {tf}: {e}")
+                logging.error(f"Error {symbol} {tf}: {e}")
 
-        # 🕒 Tambah delay 1 menit agar candle close benar-benar final
+        # Delay 1 menit agar candle benar-benar close sempurna
         logging.info(f"⏸ Selesai scan TF {tf}. Tidur {interval_minutes}+1 menit...\n")
         await asyncio.sleep(interval_minutes * 60 + 60)
 
 
 # ===========================
-# 🚀 MAIN
+# 🚀 MAIN PROGRAM
 # ===========================
 async def main():
     tasks = [
