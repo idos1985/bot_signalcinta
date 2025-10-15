@@ -1,121 +1,86 @@
-# final_signal_ma_inside_body.py
-import asyncio
 import ccxt
 import pandas as pd
-from datetime import datetime, timezone
+import asyncio
 import aiohttp
-import logging
+from datetime import datetime, timezone, timedelta
 
-# ============== KONFIG ==============
+# === ISI MANUAL ===
 TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 CHAT_ID = "7183177114"
 
+# === KONFIGURASI ===
 TIMEFRAMES = {
-    "30m": 1800 + 60,   # 30 menit + 1 menit delay
-    "1h": 3600 + 60,    # 1 jam + 1 menit delay
-    "2h": 7200 + 60     # 2 jam + 1 menit delay
+    "30m": 31 * 60,   # scan tiap 31 menit
+    "1h": 61 * 60,    # scan tiap 61 menit
+    "2h": 121 * 60    # scan tiap 121 menit
 }
 
 exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "future"}  # Binance Futures USDT-M
+    'options': {'defaultType': 'future'}
 })
 
-sent_signals = set()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-
-# ============== TELEGRAM ==============
-async def send_telegram(msg: str):
+# === Fungsi kirim pesan ke Telegram ===
+async def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": msg}
+    payload = {"chat_id": CHAT_ID, "text": message}
+    async with aiohttp.ClientSession() as session:
+        await session.post(url, data=payload)
+
+# === Ambil data candle & hitung EMA ===
+def get_ema_signals(symbol, timeframe):
     try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(url, json=data)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=110)
+        df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+        # EMA20 & EMA100
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
+
+        last = df.iloc[-1]
+        open_ = last['open']
+        close_ = last['close']
+        ema20 = last['ema20']
+        ema100 = last['ema100']
+
+        # === Bullish ===
+        if close_ > open_ and ema20 > min(open_, close_) and ema20 < max(open_, close_) \
+           and ema100 > min(open_, close_) and ema100 < max(open_, close_) \
+           and ema20 < ema100:
+            return f"📈 BULLISH: {symbol} ({timeframe})\nCandle menelan EMA20 & EMA100\nHarga: {close_:.4f}"
+
+        # === Bearish ===
+        if close_ < open_ and ema20 > min(open_, close_) and ema20 < max(open_, close_) \
+           and ema100 > min(open_, close_) and ema100 < max(open_, close_) \
+           and ema20 > ema100:
+            return f"📉 BEARISH: {symbol} ({timeframe})\nCandle menelan EMA20 & EMA100\nHarga: {close_:.4f}"
+
     except Exception as e:
-        logging.error(f"Telegram Error: {e}")
+        print(f"Error {symbol} {timeframe}: {e}")
+    return None
 
-# ============== FUNGSI DASAR ==============
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-def fetch_df(symbol, tf, limit=200):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-        return df
-    except Exception as e:
-        logging.error(f"{symbol}-{tf} fetch error: {e}")
-        return None
-
-# ============== CEK KONDISI ==============
-def check_signal(df):
-    last = df.iloc[-1]
-    ema20 = ema(df["close"], 20).iloc[-1]
-    ema100 = ema(df["close"], 100).iloc[-1]
-    open_p, close_p = last["open"], last["close"]
-
-    # === BULLISH ===
-    if close_p > open_p:
-        if open_p < ema20 < close_p and open_p < ema100 < close_p:
-            return "bullish", ema20, ema100, last
-
-    # === BEARISH ===
-    if close_p < open_p:
-        if close_p < ema20 < open_p and close_p < ema100 < open_p:
-            return "bearish", ema20, ema100, last
-
-    return None, ema20, ema100, last
-
-# ============== PROSES SCAN ==============
-async def scan(tf):
+# === Fungsi utama untuk scan semua pair ===
+async def scan_all_pairs():
     markets = exchange.load_markets()
-    symbols = [s for s in markets if s.endswith("USDT") and "DOWN" not in s and "UP" not in s]
-    logging.info(f"Mulai scan TF {tf} ({len(symbols)} pair)")
-
-    last_checked = {}
+    symbols = [s for s in markets if s.endswith('/USDT')]
+    print(f"Memindai {len(symbols)} pair USDT di Binance Futures...")
 
     while True:
-        logging.info(f"⏳ Menunggu jadwal scan TF {tf}...")
-        await asyncio.sleep(60)  # pastikan 1 menit delay setelah close candle
+        for tf, delay in TIMEFRAMES.items():
+            print(f"\n[SCAN] Timeframe: {tf} - {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
+            for symbol in symbols:
+                signal = get_ema_signals(symbol, tf)
+                if signal:
+                    print(signal)
+                    await send_telegram_message(signal)
 
-        for symbol in symbols:
-            df = fetch_df(symbol, tf, 150)
-            if df is None or len(df) < 100:
-                continue
+            # delay sesuai timeframe (sudah termasuk 1 menit tunggu candle close)
+            await asyncio.sleep(delay)
 
-            last_time = df.iloc[-1]["time"]
-            if symbol in last_checked and last_checked[symbol] == last_time:
-                continue
-            last_checked[symbol] = last_time
-
-            signal, ema20, ema100, last = check_signal(df)
-            if signal:
-                key = f"{symbol}-{tf}-{last_time}"
-                if key in sent_signals:
-                    continue
-                sent_signals.add(key)
-
-                msg = (
-                    f"{'🟢 Bullish' if signal == 'bullish' else '🔴 Bearish'} Signal\n"
-                    f"Pair: {symbol}\n"
-                    f"TF: {tf}\n"
-                    f"Close Candle: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                    f"Open: {last.open:.4f} | Close: {last.close:.4f}\n"
-                    f"EMA20: {ema20:.4f} | EMA100: {ema100:.4f}\n"
-                    f"✅ MA berada di dalam body candle"
-                )
-                await send_telegram(msg)
-                logging.info(f"✅ Sinyal {signal.upper()} {symbol} {tf} dikirim")
-
-        logging.info(f"⏸ Selesai scan TF {tf}. Tunggu interval berikut...\n")
-        await asyncio.sleep(TIMEFRAMES[tf])
-
-# ============== MAIN LOOP ==============
+# === Jalankan ===
 async def main():
-    tasks = [asyncio.create_task(scan(tf)) for tf in TIMEFRAMES.keys()]
-    await asyncio.gather(*tasks)
+    print("Bot mulai jalan... Tunggu sinyal terbentuk.")
+    await scan_all_pairs()
 
 if __name__ == "__main__":
     asyncio.run(main())
