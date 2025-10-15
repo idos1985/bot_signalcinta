@@ -1,11 +1,14 @@
+# main.py
 """
-FINAL VERSION — Signal Scanner (EMA-based)
+🚀 Final Version — Bullish & Bearish Signal Detector (EMA-based)
+==============================================================
 Timeframes: 30m / 1h / 2h
 Kriteria valid:
-✅ 1 candle hijau: EMA20 (bawah) & EMA100 (atas)
-✅ 1 candle merah: EMA20 (atas) & EMA100 (bawah)
-Skip jika 1D naik/turun ±5%
-Scan semua Binance USDⓈ-M futures (perpetual)
+✅ Bullish: 1 candle hijau, EMA20 (bawah) & EMA100 (atas)
+✅ Bearish: 1 candle merah, EMA20 (atas) & EMA100 (bawah)
+EMA dihitung real-time hanya sampai close candle terakhir
+Skip jika 1D naik/turun ≥ 5%
+Scan semua Binance USDⓈ-M (perpetual) pairs
 """
 
 import asyncio
@@ -16,15 +19,14 @@ import ccxt
 from telegram import Bot
 
 # ===========================
-# 🔧 TELEGRAM CONFIG
+# 🔧 KONFIGURASI TELEGRAM
 # ===========================
 API_KEY = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 CHAT_ID = "7183177114"
-
 bot = Bot(API_KEY)
 
 # ===========================
-# 🔧 SETUP EXCHANGE
+# 🔧 SETUP EXCHANGE BINANCE
 # ===========================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -39,7 +41,7 @@ logging.basicConfig(level=logging.INFO)
 # 🔧 HELPER FUNCTIONS
 # ===========================
 def get_ohlcv(symbol, tf, limit=200):
-    """Ambil data OHLCV dari Binance"""
+    """Ambil data OHLCV"""
     try:
         data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
         df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
@@ -47,12 +49,12 @@ def get_ohlcv(symbol, tf, limit=200):
         df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
         return df
     except Exception as e:
-        logging.error(f"Error fetching {symbol}-{tf}: {e}")
+        logging.error(f"Error fetch {symbol}-{tf}: {e}")
         return None
 
 
 def check_daily_change(df):
-    """Skip jika harga 1D naik/turun >=5%"""
+    """Skip jika harga 1D naik/turun ≥5%"""
     if df is None or len(df) < 2:
         return True
     change = (df.iloc[-1]["close"] - df.iloc[0]["open"]) / df.iloc[0]["open"] * 100
@@ -60,46 +62,43 @@ def check_daily_change(df):
 
 
 def ema(series, period):
+    """Hitung EMA"""
     return series.ewm(span=period, adjust=False).mean()
 
 
-def is_valid_candle(df):
+def detect_signal(df):
     """
-    Cek candle terakhir:
-    ✅ Bullish jika EMA20 (bawah) & EMA100 (atas)
-    ✅ Bearish jika EMA20 (atas) & EMA100 (bawah)
+    Deteksi candle terakhir:
+    Bullish: 1 candle hijau, EMA20 bawah, EMA100 atas
+    Bearish: 1 candle merah, EMA20 atas, EMA100 bawah
+    EMA dihitung real-time hanya sampai close terakhir
     """
-    if len(df) < 100:
-        return None
-
-    # Hitung EMA untuk seluruh seri
-    df["ema20"] = ema(df["close"], 20)
-    df["ema100"] = ema(df["close"], 100)
-
-    # Ambil candle terakhir
     last = df.iloc[-1]
-    ema20 = last["ema20"]
-    ema100 = last["ema100"]
+
+    # Hitung EMA saat close terakhir (real-time)
+    ema20_now = ema(df["close"], 20).iloc[-1]
+    ema100_now = ema(df["close"], 100).iloc[-1]
+
     open_price = last["open"]
     close_price = last["close"]
 
-    # --- Bullish ---
+    # === BULLISH ===
     if close_price > open_price:
-        if ema20 > min(open_price, close_price) and ema100 < max(open_price, close_price):
-            if ema20 < ema100:  # valid posisi
+        if ema20_now > min(open_price, close_price) and ema100_now < max(open_price, close_price):
+            if ema20_now < ema100_now:  # posisi valid
                 return "BULLISH"
 
-    # --- Bearish ---
-    if close_price < open_price:
-        if ema20 < max(open_price, close_price) and ema100 > min(open_price, close_price):
-            if ema20 > ema100:  # valid posisi
+    # === BEARISH ===
+    elif close_price < open_price:
+        if ema20_now < max(open_price, close_price) and ema100_now > min(open_price, close_price):
+            if ema20_now > ema100_now:
                 return "BEARISH"
 
     return None
 
 
 async def send_telegram(msg):
-    """Kirim pesan ke Telegram"""
+    """Kirim notif ke Telegram"""
     try:
         await bot.send_message(chat_id=CHAT_ID, text=msg)
     except Exception as e:
@@ -107,15 +106,15 @@ async def send_telegram(msg):
 
 
 # ===========================
-# 🔁 SCAN LOOP
+# 🔁 SCANNER LOOP
 # ===========================
 async def scan_timeframe(tf, interval_minutes):
-    """Loop utama scan tiap timeframe"""
+    """Scan tiap TF"""
     markets = exchange.load_markets()
     symbols = [s for s in markets if s.endswith("USDT")]
 
     while True:
-        logging.info(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scanning {len(symbols)} pairs — TF {tf}")
+        logging.info(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 🔍 Scanning {len(symbols)} pairs — TF {tf}")
 
         for symbol in symbols:
             try:
@@ -123,16 +122,16 @@ async def scan_timeframe(tf, interval_minutes):
                 if df is None:
                     continue
 
-                # Skip jika daily sudah naik/turun 5%
+                # Skip pair yang daily change ±5%
                 df1d = get_ohlcv(symbol, "1d", 10)
                 if check_daily_change(df1d):
                     continue
 
-                signal = is_valid_candle(df)
+                signal = detect_signal(df)
                 if not signal:
                     continue
 
-                # Buat ID unik supaya tidak kirim dobel
+                # Hindari notif duplikat
                 last_time = df.iloc[-1]["time"]
                 signal_id = f"{symbol}-{tf}-{last_time}-{signal}"
                 if signal_id in sent_signals:
@@ -144,15 +143,16 @@ async def scan_timeframe(tf, interval_minutes):
                     f"Pair: {symbol}\n"
                     f"Timeframe: {tf}\n"
                     f"Time: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                    f"EMA20 / EMA100 berada di dalam body candle ✅"
+                    f"EMA20 bawah / EMA100 atas ✅" if signal == "BULLISH" else
+                    f"EMA20 atas / EMA100 bawah ✅"
                 )
                 await send_telegram(msg)
-                logging.info(f"Sent: {msg}")
+                logging.info(f"✅ {signal} {symbol} {tf}")
 
             except Exception as e:
-                logging.error(f"Error on {symbol} {tf}: {e}")
+                logging.error(f"Error {symbol} {tf}: {e}")
 
-        logging.info(f"Selesai scan TF {tf}. Tidur {interval_minutes} menit...\n")
+        logging.info(f"⏸ Selesai scan TF {tf}. Tidur {interval_minutes} menit...\n")
         await asyncio.sleep(interval_minutes * 60)
 
 
