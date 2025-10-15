@@ -1,176 +1,133 @@
-# ============================================================
-# 🚀 Engulfing Detector (Sinkron dengan Waktu Candle Close)
-# ============================================================
-# 🔹 Scan semua pair USDT di Binance Futures (USDT-M)
-# 🔹 Timeframe: 30m / 1h / 2h
-# 🔹 Bullish Engulfing: menembus MA20(bawah) & MA100(atas)
-# 🔹 Bearish Engulfing: menembus MA20(atas) & MA100(bawah)
-# 🔹 Kirim sinyal hanya saat candle baru benar-benar close
-# ============================================================
-
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-import pandas as pd
 import ccxt
-from telegram import Bot
+import pandas as pd
+import telegram
 
-# ==========================
-# 🔧 KONFIGURASI TELEGRAM
-# ==========================
+# =============== KONFIGURASI ===============
 TELEGRAM_TOKEN = "8309387013:AAHHMBhUcsmBPOX2j5aEJatNmiN6VnhI2CM"
 CHAT_ID = "7183177114"
-bot = Bot(token=TELEGRAM_TOKEN)
+TIMEFRAMES = ["30m", "1h", "2h"]
+SCAN_INTERVAL = {"30m": 30, "1h": 60, "2h": 120}  # menit
+DELAY_AFTER_CLOSE = 1  # menit
+# ===========================================
 
-# ==========================
-# 🔧 BINANCE FUTURES
-# ==========================
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "future"}
-})
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
+exchange = ccxt.binance({'options': {'defaultType': 'future'}})
 
-# ==========================
-# 🧠 SETUP
-# ==========================
+sent_signals = set()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
-sent = {}  # {(symbol, tf): last_candle_time}
 
 
-# ==========================
-# 🔹 UTILITAS
-# ==========================
-def get_ohlcv(symbol, tf, limit=200):
-    """Ambil data OHLCV"""
+async def fetch_ohlcv(pair, timeframe):
     try:
-        data = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-        df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+        bars = exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=150)
+        df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         return df
     except Exception as e:
-        logging.error(f"{symbol}-{tf} error fetch: {e}")
+        logging.error(f"Gagal fetch {pair} {timeframe}: {e}")
         return None
 
 
-def ema(series, period):
-    """Hitung EMA"""
-    return series.ewm(span=period, adjust=False).mean()
+def calculate_ema(df, period):
+    return df["close"].ewm(span=period, adjust=False).mean()
 
 
 def is_bullish_engulfing(df):
-    prev, last = df.iloc[-2], df.iloc[-1]
-    return (
-        last["close"] > last["open"] and
-        prev["close"] < prev["open"] and
-        last["close"] > prev["open"] and
-        last["open"] < prev["close"]
-    )
+    if len(df) < 3:
+        return False
+    last = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    merah_dua = (prev1["close"] < prev1["open"]) and (prev2["close"] < prev2["open"])
+    hijau_menelan = (last["close"] > last["open"]) and (last["close"] > prev1["open"]) and (last["open"] < prev1["close"])
+    return merah_dua and hijau_menelan
 
 
 def is_bearish_engulfing(df):
-    prev, last = df.iloc[-2], df.iloc[-1]
-    return (
-        last["close"] < last["open"] and
-        prev["close"] > prev["open"] and
-        last["open"] > prev["close"] and
-        last["close"] < prev["open"]
-    )
+    if len(df) < 3:
+        return False
+    last = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    hijau_dua = (prev1["close"] > prev1["open"]) and (prev2["close"] > prev2["open"])
+    merah_menelan = (last["close"] < last["open"]) and (last["close"] < prev1["open"]) and (last["open"] > prev1["close"])
+    return hijau_dua and merah_menelan
 
 
-# ==========================
-# 🔁 SCANNER
-# ==========================
-async def scan_timeframe(tf, interval_minutes):
-    """Scan timeframe tertentu sinkron dengan jam close candle"""
-    symbols = [s for s in exchange.load_markets() if s.endswith("USDT")]
-    logging.info(f"✅ Mulai scanner TF {tf} ({len(symbols)} pair)")
+async def check_signal(pair, timeframe):
+    df = await fetch_ohlcv(pair, timeframe)
+    if df is None or len(df) < 120:
+        return
 
-    # Loop tanpa henti
+    df["EMA20"] = calculate_ema(df, 20)
+    df["EMA100"] = calculate_ema(df, 100)
+    last = df.iloc[-1]
+
+    now = datetime.now(timezone.utc)
+    candle_close_time = last["timestamp"]
+
+    # Pastikan candle sudah close + delay 1 menit
+    if (now - candle_close_time) < timedelta(minutes=DELAY_AFTER_CLOSE):
+        return
+
+    signal_id = f"{pair}_{timeframe}_{last['timestamp']}"
+    if signal_id in sent_signals:
+        return
+
+    # Bullish Engulfing → close di atas EMA20 & EMA100
+    if is_bullish_engulfing(df) and last["close"] > last["EMA20"] and last["close"] > last["EMA100"]:
+        msg = (
+            f"🟢 [BULLISH ENGULFING]\n"
+            f"Pair: {pair}\n"
+            f"Timeframe: {timeframe}\n"
+            f"Close: {last['timestamp']:%Y-%m-%d %H:%M UTC}\n"
+            f"Price: {last['close']:.6f}\n"
+            f"EMA20: {last['EMA20']:.6f} | EMA100: {last['EMA100']:.6f}"
+        )
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        sent_signals.add(signal_id)
+        logging.info(f"✅ Bullish signal: {pair} {timeframe}")
+
+    # Bearish Engulfing → close di bawah EMA20 & EMA100
+    elif is_bearish_engulfing(df) and last["close"] < last["EMA20"] and last["close"] < last["EMA100"]:
+        msg = (
+            f"🔴 [BEARISH ENGULFING]\n"
+            f"Pair: {pair}\n"
+            f"Timeframe: {timeframe}\n"
+            f"Close: {last['timestamp']:%Y-%m-%d %H:%M UTC}\n"
+            f"Price: {last['close']:.6f}\n"
+            f"EMA20: {last['EMA20']:.6f} | EMA100: {last['EMA100']:.6f}"
+        )
+        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        sent_signals.add(signal_id)
+        logging.info(f"✅ Bearish signal: {pair} {timeframe}")
+
+
+async def get_futures_pairs():
+    markets = exchange.load_markets()
+    return [s for s in markets if s.endswith(":USDT") and "USDT" in s]
+
+
+async def scan_timeframe(timeframe, pairs):
     while True:
-        now = datetime.now(timezone.utc)
-
-        # Hitung waktu candle berikutnya akan close
-        minute = now.minute
-        if tf == "30m":
-            next_close_minute = 30 if minute < 30 else 60
-            next_close = now.replace(minute=next_close_minute % 60, second=0, microsecond=0)
-            if next_close_minute == 60:
-                next_close += timedelta(hours=1)
-        elif tf == "1h":
-            next_close = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        elif tf == "2h":
-            next_close_hour = (now.hour // 2 + 1) * 2
-            next_close = now.replace(hour=next_close_hour % 24, minute=0, second=0, microsecond=0)
-            if next_close_hour >= 24:
-                next_close += timedelta(days=1)
-        else:
-            next_close = now + timedelta(minutes=interval_minutes)
-
-        # Tunggu sampai candle benar-benar close + 1 menit (biar MA valid)
-        wait_seconds = (next_close - now).total_seconds() + 60
-        logging.info(f"⏳ {tf}: tunggu {int(wait_seconds/60)} menit sampai candle close...")
-        await asyncio.sleep(wait_seconds)
-
-        # Saatnya scan
-        logging.info(f"🕒 {tf}: mulai scan candle baru...")
-        for symbol in symbols:
+        logging.info(f"Mulai scan timeframe {timeframe}")
+        for pair in pairs:
             try:
-                df = get_ohlcv(symbol, tf, 200)
-                if df is None or len(df) < 2:
-                    continue
-
-                last_time = df.iloc[-1]["time"]
-                if (symbol, tf) in sent and sent[(symbol, tf)] == last_time:
-                    continue  # sudah dikirim untuk candle ini
-
-                ema20 = ema(df["close"], 20).iloc[-1]
-                ema100 = ema(df["close"], 100).iloc[-1]
-                last = df.iloc[-1]
-
-                # === BULLISH ENGULFING ===
-                if is_bullish_engulfing(df):
-                    if last["open"] > ema20 and last["close"] > ema100 and ema20 < ema100:
-                        msg = (
-                            f"🟢 [BULLISH ENGULFING]\n"
-                            f"Pair: {symbol}\n"
-                            f"Timeframe: {tf}\n"
-                            f"Close: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                            f"EMA20: {ema20:.4f} | EMA100: {ema100:.4f}"
-                        )
-                        await bot.send_message(chat_id=CHAT_ID, text=msg)
-                        sent[(symbol, tf)] = last_time
-                        logging.info(f"BULLISH {symbol} {tf}")
-
-                # === BEARISH ENGULFING ===
-                elif is_bearish_engulfing(df):
-                    if last["open"] < ema20 and last["close"] < ema100 and ema20 > ema100:
-                        msg = (
-                            f"🔴 [BEARISH ENGULFING]\n"
-                            f"Pair: {symbol}\n"
-                            f"Timeframe: {tf}\n"
-                            f"Close: {last_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                            f"EMA20: {ema20:.4f} | EMA100: {ema100:.4f}"
-                        )
-                        await bot.send_message(chat_id=CHAT_ID, text=msg)
-                        sent[(symbol, tf)] = last_time
-                        logging.info(f"BEARISH {symbol} {tf}")
-
+                await check_signal(pair, timeframe)
+                await asyncio.sleep(0.8)
             except Exception as e:
-                logging.error(f"{symbol} {tf} error: {e}")
+                logging.error(f"Error {pair} {timeframe}: {e}")
+        await asyncio.sleep(SCAN_INTERVAL[timeframe] * 60)  # tunggu sesuai TF
 
-        logging.info(f"✅ TF {tf} selesai scan.\n")
 
-
-# ==========================
-# 🚀 MAIN
-# ==========================
 async def main():
-    tasks = [
-        asyncio.create_task(scan_timeframe("30m", 30)),
-        asyncio.create_task(scan_timeframe("1h", 60)),
-        asyncio.create_task(scan_timeframe("2h", 120)),
-    ]
+    pairs = await get_futures_pairs()
+    logging.info(f"Total pair futures: {len(pairs)}")
+
+    tasks = [scan_timeframe(tf, pairs) for tf in TIMEFRAMES]
     await asyncio.gather(*tasks)
 
 
